@@ -26,7 +26,7 @@ def main():
     os.chdir(_PROJECT_ROOT)
 
     host = os.environ.get("UI_HOST", "127.0.0.1")
-    port = int(os.environ.get("UI_PORT", "8502"))
+    port = int(os.environ.get("UI_PORT", "8503"))
 
     if _port_in_use(host, port):
         print(

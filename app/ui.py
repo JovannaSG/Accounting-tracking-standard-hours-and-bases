@@ -320,10 +320,9 @@ def _render_login_form() -> None:
     )
     with st.form("login_form"):
         login_input = st.text_input("Логин", key="login_user")
-        show_pwd = st.checkbox("Показать пароль", key="login_show_pwd")
         password_input = st.text_input(
             "Пароль",
-            type="default" if show_pwd else "password",
+            type="password",
             key="login_pass",
         )
         submitted = st.form_submit_button(

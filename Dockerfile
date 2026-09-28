@@ -18,7 +18,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY core ./core
-COPY users.example.json users.example.json
 
 # Рабочие данные (БД + конфиг пользователей) хранятся в /data.
 # Это каталог тома docker-compose: при первом запуске в него копируется

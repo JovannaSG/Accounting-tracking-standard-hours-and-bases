@@ -199,15 +199,14 @@ def test_role_label_in_sidebar_is_russian(clean_db):
     assert "· admin" not in caption
 
 
-def test_login_password_can_be_shown(clean_db):
+def test_login_password_is_always_masked(clean_db):
+    """Переключателя «показать пароль» на форме входа нет (ui.py)."""
     db.upsert_user("admin", auth.ROLE_ADMIN, auth.hash_password("secret"), [])
     at = _run_app()
-    assert at.checkbox(key="login_show_pwd").value is False
-    at.checkbox(key="login_show_pwd").set_value(True)
-    at.run()
+    assert not _has_key(at, "checkbox", "login_show_pwd")
+    _login(at, "admin", "secret")
     assert not at.exception
-    assert at.checkbox(key="login_show_pwd").value is True
-    assert at.text_input(key="login_pass") is not None
+    assert at.session_state["login"] == "admin"
 
 
 def test_locked_login_shows_lockout_message(clean_db):

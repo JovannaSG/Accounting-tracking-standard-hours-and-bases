@@ -44,7 +44,7 @@ pip install -r requirements.txt
 | `AUDIT_USERS_CONFIG` | Путь к `users.json` (роли + доступы к базам) | `users.json` |
 | `AUDIT_USERS` | Fallback-пользователи `логин:хэш,логин2:хэш2` (PBKDF2) | пусто (выкл.) |
 | `AUDIT_DB_SECRET_KEY` | Ключ шифрования паролей клиентских баз (Fernet, base64 32 байта) | пусто (пароли в открытом виде) |
-| `UI_HOST` / `UI_PORT` | Адрес/порт Streamlit | `127.0.0.1` / `8502` |
+| `UI_HOST` / `UI_PORT` | Адрес/порт Streamlit | `127.0.0.1` / `8503` |
 | `UI_IDLE_TIMEOUT_MIN` | Таймаут бездействия сессии, мин (0 — не завершать) | `30` |
 
 Авторизация: скопировать `users.example.json` → `users.json`, сгенерировать
@@ -78,7 +78,7 @@ python -c "import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_b
 python app/run.py
 ```
 
-Открыть в браузере: http://127.0.0.1:8502
+Открыть в браузере: http://127.0.0.1:8503
 
 ## Запуск в Docker
 
@@ -86,11 +86,16 @@ python app/run.py
 docker compose up -d --build
 ```
 
-Открыть в браузере: http://localhost:8502
+Открыть в браузере: http://localhost:8503
 
 Рабочие данные (SQLite-БД и `users.json`) хранятся в docker-томе
 `norm-hours-data` (каталог `/data`). Внешний порт и переменные окружения —
 в `docker-compose.yml`.
+
+Несколько экземпляров на одной виртуальной машине: у каждого свой внешний
+порт (`8503:8503`, `8504:8503`, …), своё имя контейнера (`container_name`)
+и свой том — измените эти три значения в `docker-compose.yml` либо запускайте
+через `docker compose -p <имя> up -d`.
 
 Подробности по учётным записям, ролям, настройке баз/норм/сотрудников и
 эксплуатации — в [руководстве администратора и пользователя](docs/Руководство_администратора_и_пользователя.md).
