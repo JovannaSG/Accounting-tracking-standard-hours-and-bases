@@ -1,0 +1,12 @@
+{
+  "admin": {
+    "role": "admin",
+    "password": "admin_example_change_me"
+  },
+  "buhgalter": {
+    "role": "accountant",
+    "allowed_urls": [
+      "https://msk1.1cfresh.com/a/ea/1119958"
+    ]
+  }
+}

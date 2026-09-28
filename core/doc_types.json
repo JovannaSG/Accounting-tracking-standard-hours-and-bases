@@ -1,0 +1,131 @@
+{
+  "bank_incoming": {
+    "category": "Банк и касса",
+    "title": "Поступление на расчетный счет",
+    "entity": "Document_ПоступлениеНаРасчетныйСчет",
+    "unit": "операция"
+  },
+  "bank_outgoing": {
+    "category": "Банк и касса",
+    "title": "Списание с расчетного счета",
+    "entity": "Document_СписаниеСРасчетногоСчета",
+    "unit": "операция"
+  },
+  "cash_income": {
+    "category": "Банк и касса",
+    "title": "Поступление наличных",
+    "entity": "Document_ПриходныйКассовыйОрдер",
+    "unit": "документ"
+  },
+  "cash_outgoing": {
+    "category": "Банк и касса",
+    "title": "Выдача наличных",
+    "entity": "Document_РасходныйКассовыйОрдер",
+    "unit": "документ"
+  },
+  "payment_order": {
+    "category": "Банк и касса",
+    "title": "Платежное поручение",
+    "entity": "Document_ПлатежноеПоручение",
+    "unit": "документ"
+  },
+  "goods_incoming": {
+    "category": "Первичные документы",
+    "title": "Поступление (акт, накладная, УПД)",
+    "entity": "Document_ПоступлениеТоваровУслуг",
+    "unit": "документ"
+  },
+  "goods_outgoing": {
+    "category": "Первичные документы",
+    "title": "Реализация (акт, накладная, УПД)",
+    "entity": "Document_РеализацияТоваровУслуг",
+    "unit": "документ"
+  },
+  "invoice_customer": {
+    "category": "Первичные документы",
+    "title": "Счет покупателю",
+    "entity": "Document_СчетНаОплатуПокупателю",
+    "unit": "документ"
+  },
+  "sf_issued": {
+    "category": "Первичные документы",
+    "title": "Счет-фактура выданный",
+    "entity": "Document_СчетФактураВыданный",
+    "unit": "документ"
+  },
+  "sf_received": {
+    "category": "Первичные документы",
+    "title": "Счет-фактура полученный",
+    "entity": "Document_СчетФактураПолученный",
+    "unit": "документ"
+  },
+  "return_supplier": {
+    "category": "Первичные документы",
+    "title": "Возврат товаров поставщику",
+    "entity": "Document_ВозвратТоваровПоставщику",
+    "unit": "документ"
+  },
+  "correction_incoming": {
+    "category": "Первичные документы",
+    "title": "Корректировка поступления",
+    "entity": "Document_КорректировкаПоступления",
+    "unit": "документ"
+  },
+  "correction_outgoing": {
+    "category": "Первичные документы",
+    "title": "Корректировка реализации",
+    "entity": "Document_КорректировкаРеализации",
+    "unit": "документ"
+  },
+  "debt_correction": {
+    "category": "Первичные документы",
+    "title": "Корректировка долга",
+    "entity": "Document_КорректировкаДолга",
+    "unit": "документ"
+  },
+  "advance_report": {
+    "category": "Первичные документы",
+    "title": "Авансовый отчет до 10 чеков",
+    "entity": "Document_АвансовыйОтчет",
+    "unit": "отчет",
+    "variant_field": "ВидОперации",
+    "variants": ["гсм", "топлив", "бензин", "командиров", "путев"],
+    "variant_to": "advance_report_travel"
+  },
+  "advance_report_travel": {
+    "category": "Первичные документы",
+    "title": "Авансовый отчет до 10 чеков с ГСМ или командировкой",
+    "entity": "Document_АвансовыйОтчет",
+    "unit": "отчет"
+  },
+  "transfer_materials_to_operation": {
+    "category": "ТМЦ и ОС",
+    "title": "Передача материалов в эксплуатацию",
+    "entity": "Document_ПередачаМатериаловВЭксплуатацию",
+    "unit": "документ"
+  },
+  "requirement_invoice": {
+    "category": "ТМЦ и ОС",
+    "title": "Требование-накладная (расход материалов)",
+    "entity": "Document_ТребованиеНакладная",
+    "unit": "документ"
+  },
+  "writeoff_goods": {
+    "category": "ТМЦ и ОС",
+    "title": "Списание товаров, материалов",
+    "entity": "Document_СписаниеТоваров",
+    "unit": "документ"
+  },
+  "writeoff_materials_from_use": {
+    "category": "ТМЦ и ОС",
+    "title": "Списание материалов из эксплуатации",
+    "entity": "Document_СписаниеМатериаловИзЭксплуатации",
+    "unit": "документ"
+  },
+  "return_customer": {
+    "category": "Первичные документы",
+    "title": "Возврат товаров от покупателя",
+    "entity": "Document_ВозвратТоваровОтПокупателя",
+    "unit": "документ"
+  }
+}

@@ -1,0 +1,43 @@
+services:
+  norm-hours:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: norm-hours:latest
+    container_name: norm-hours
+    restart: unless-stopped
+    ports:
+      # "ХОСТ:КОНТЕЙНЕР". Чтобы сменить внешний порт,
+      # укажите другой слева, например "8501:8502".
+      - "8502:8502"
+    environment:
+      AUDIT_DB_PATH: /data/norm_hours.db
+      AUDIT_USERS_CONFIG: /data/users.json
+      # Опциональный fallback-список «логин:хэш» (PBKDF2),
+      # см. `python -m core.auth hash <пароль>`.
+      # AUDIT_USERS: ""
+      # Ключ шифрования паролей клиентских баз (Fernet, base64 32 байт).
+      # Сгенерировать: python -c "import base64,secrets;
+      # print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())"
+      # Без ключа пароли хранятся в открытом виде.
+      # AUDIT_DB_SECRET_KEY: ""
+      UI_HOST: 0.0.0.0
+      UI_PORT: "8502"
+      # Таймаут бездействия сессии, мин (0 — не завершать)
+      UI_IDLE_TIMEOUT_MIN: "30"
+    volumes:
+      # Рабочие данные: SQLite-БД приложения и users.json.
+      # Файлы долговечны, но для бэкапа тома см. руководство.
+      - norm-hours-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8502/_stcore/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  # Имя фиксировано, чтобы команда бэкапа тома в руководстве
+  # была одинаковой на всех хостах.
+  norm-hours-data:
+    name: norm-hours-data
