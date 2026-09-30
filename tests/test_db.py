@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 import tempfile
+from unittest import mock
 
 import pytest
 
@@ -234,6 +235,245 @@ def _raw_password(base_id: int) -> str:
     ).fetchone()
     conn.close()
     return row[0]
+
+
+# ===================== ОБНОВЛЕНИЕ СОТРУДНИКА ПО ID =========================
+
+def test_update_employee_by_id(clean_db):
+    """ФИО изменяемо, поэтому правка адресуется по id, а не по имени."""
+    emp = db.upsert_employee(
+        full_name="Иванова Анна", user_1c="Иванова А.А.", role="Бухгалтер",
+    )
+    assert db.update_employee(emp["id"], full_name="Иванова Анна Петровна") is True
+
+    got = db.get_employee(emp_id=emp["id"])
+    assert got["full_name"] == "Иванова Анна Петровна"
+    # id не меняется, алиас и роль сохраняются (None = не трогать)
+    assert got["id"] == emp["id"]
+    assert got["user_1c"] == "Иванова А.А."
+    assert got["role"] == "Бухгалтер"
+    assert db.get_employee(full_name="Иванова Анна") is None
+
+
+def test_update_employee_none_leaves_fields_untouched(clean_db):
+    emp = db.upsert_employee(
+        full_name="Петрова Е.В.", user_1c="Е_Петрова", role="Бухгалтер",
+        hours_per_month=100.0,
+    )
+    assert db.update_employee(emp["id"], comment="заметка") is True
+    got = db.get_employee(emp_id=emp["id"])
+    assert got["full_name"] == "Петрова Е.В."
+    assert got["user_1c"] == "Е_Петрова"
+    assert got["hours_per_month"] == pytest.approx(100.0)
+    assert got["comment"] == "заметка"
+
+
+def test_update_employee_can_deactivate_and_clear_alias(clean_db):
+    emp = db.upsert_employee(full_name="Сидоров С.С.", user_1c="С_Сидоров")
+    assert db.update_employee(
+        emp["id"], user_1c="", active=False,
+    ) is True
+    got = db.get_employee(emp_id=emp["id"])
+    assert got["user_1c"] is None
+    assert got["active"] is False
+    assert db.list_employees(active_only=True) == []
+
+
+def test_update_employee_duplicate_name_rejected_and_rolled_back(clean_db):
+    """Дубль ФИО -> False; откат не оставляет «отравленное» соединение."""
+    first = db.upsert_employee(full_name="Иванова Анна")
+    second = db.upsert_employee(full_name="Петрова Елена")
+
+    assert db.update_employee(second["id"], full_name="Иванова Анна") is False
+    # Запись не изменилась
+    assert db.get_employee(emp_id=second["id"])["full_name"] == "Петрова Елена"
+    # Первая запись на месте
+    assert db.get_employee(emp_id=first["id"])["full_name"] == "Иванова Анна"
+    # Соединение переиспользуемо: следующий вызов в том же процессе работает
+    assert db.update_employee(first["id"], role="Бухгалтер") is True
+    assert db.get_employee(emp_id=first["id"])["role"] == "Бухгалтер"
+
+
+def test_update_employee_cascades_to_user_link(clean_db):
+    """Переименование не должно осиротить бухгалтера (ТЗ §11)."""
+    emp = db.upsert_employee(full_name="Иванова Анна")
+    db.upsert_user(
+        login="buh1", role="accountant", password_hash="h", allowed_urls=[],
+        employee_full_name="Иванова Анна",
+    )
+    assert db.update_employee(emp["id"], full_name="Иванова Анна Петровна") is True
+    assert db.get_user("buh1")["employee_full_name"] == "Иванова Анна Петровна"
+
+
+def test_update_employee_cascade_is_case_insensitive(clean_db):
+    emp = db.upsert_employee(full_name="Иванова Анна")
+    db.upsert_user(
+        login="buh2", role="accountant", password_hash="h", allowed_urls=[],
+        employee_full_name="ИВАНОВА АННА",
+    )
+    assert db.update_employee(emp["id"], full_name="Иванова А.П.") is True
+    assert db.get_user("buh2")["employee_full_name"] == "Иванова А.П."
+
+
+def test_update_employee_cascade_rolled_back_with_employee(clean_db):
+    """Конфликт UNIQUE откатывает и employees, и users в одной транзакции."""
+    keeper = db.upsert_employee(full_name="Иванова Анна")
+    other = db.upsert_employee(full_name="Петрова Елена")
+    db.upsert_user(
+        login="buh3", role="accountant", password_hash="h", allowed_urls=[],
+        employee_full_name="Петрова Елена",
+    )
+    assert db.update_employee(other["id"], full_name="Иванова Анна") is False
+    assert db.get_user("buh3")["employee_full_name"] == "Петрова Елена"
+    assert db.get_employee(emp_id=keeper["id"])["full_name"] == "Иванова Анна"
+
+
+def test_update_employee_no_cascade_when_name_unchanged(clean_db):
+    """Смена только роли не должна трогать users."""
+    emp = db.upsert_employee(full_name="Иванова Анна")
+    db.upsert_user(
+        login="buh4", role="accountant", password_hash="h", allowed_urls=[],
+        employee_full_name="Иванова Анна",
+    )
+    assert db.update_employee(
+        emp["id"], full_name="  иванова анна  ", role="Главный бухгалтер",
+    ) is True
+    assert db.get_user("buh4")["employee_full_name"] == "Иванова Анна"
+    assert db.get_employee(emp_id=emp["id"])["role"] == "Главный бухгалтер"
+
+
+def test_update_employee_rejects_bad_arguments(clean_db):
+    emp = db.upsert_employee(full_name="Иванова Анна")
+    assert db.update_employee(999999, full_name="Нет Такого") is False
+    assert db.update_employee(emp["id"], full_name="   ") is False
+    assert db.get_employee(emp_id=emp["id"])["full_name"] == "Иванова Анна"
+
+
+def test_update_employee_closes_connection_on_every_path(clean_db):
+    """Все ветки (успех, дубль ФИО, несуществующий id) закрывают соединение:
+    иначе update_employee копил бы незакрытые соединения SQLite."""
+
+    emp = db.upsert_employee(full_name="Иванова Анна")
+    other = db.upsert_employee(full_name="Петрова Елена")
+
+    real_connect = sqlite3.connect
+    opened = []
+
+    def tracking_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    with mock.patch.object(db.sqlite3, "connect", tracking_connect):
+        assert db.update_employee(emp["id"], role="Бухгалтер") is True
+        assert db.update_employee(
+            other["id"], full_name="Иванова Анна"
+        ) is False  # дубль ФИО -> IntegrityError
+
+    assert opened, "ожидалось хотя бы одно открытое соединение"
+    for conn in opened:
+        # закрытое соединение падает на execute с ProgrammingError
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+
+# ==================== ВИДЫ ДОКУМЕНТОВ НА УРОВНЕ БАЗЫ ======================
+
+def test_base_active_doc_types_defaults_to_all(clean_db):
+    """Пустое значение = выгружать все виды из doc_types.json."""
+    base = db.insert_base("Клиент", "https://msk1.1cfresh.com/a/ea/1", "u", "p")
+    assert base["active_doc_types"] == []
+    assert db.get_base_by_id(base["id"])["active_doc_types"] == []
+    assert db.list_bases()[0]["active_doc_types"] == []
+
+
+def test_base_active_doc_types_roundtrip(clean_db):
+    base = db.insert_base(
+        "Клиент", "https://msk1.1cfresh.com/a/ea/1", "u", "p",
+        active_doc_types=["bank_incoming", "payment_order"],
+    )
+    assert base["active_doc_types"] == ["bank_incoming", "payment_order"]
+
+    # Через get_base (по URL) и list_bases — тоже разобранный список
+    assert db.get_base("https://msk1.1cfresh.com/a/ea/1")["active_doc_types"] == [
+        "bank_incoming", "payment_order",
+    ]
+    assert db.list_bases()[0]["active_doc_types"] == [
+        "bank_incoming", "payment_order",
+    ]
+
+    assert db.update_base(base["id"], active_doc_types=["goods_incoming"]) is True
+    assert db.get_base_by_id(base["id"])["active_doc_types"] == ["goods_incoming"]
+
+    # Пустой список — снять ограничение, а не «без изменений»
+    assert db.update_base(base["id"], active_doc_types=[]) is True
+    assert db.get_base_by_id(base["id"])["active_doc_types"] == []
+
+
+def test_update_base_none_keeps_doc_types(clean_db):
+    base = db.insert_base(
+        "Клиент", "https://msk1.1cfresh.com/a/ea/1", "u", "p",
+        active_doc_types=["bank_incoming"],
+    )
+    assert db.update_base(base["id"], name="Клиент 2") is True
+    assert db.get_base_by_id(base["id"])["active_doc_types"] == ["bank_incoming"]
+    assert db.get_base_by_id(base["id"])["name"] == "Клиент 2"
+
+
+def test_base_active_doc_types_additive_migration(monkeypatch):
+    """Старая БД без active_doc_types доращивается в init_db()."""
+    tmp = tempfile.mkdtemp(prefix="bases_schema_")
+    legacy = os.path.join(tmp, "legacy.db")
+    monkeypatch.setattr(db, "_DB_PATH", legacy)
+
+    conn = sqlite3.connect(legacy)
+    conn.execute(
+        "CREATE TABLE bases ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,"
+        "url TEXT NOT NULL UNIQUE, login TEXT, password TEXT,"
+        "created_at TEXT, active INTEGER NOT NULL DEFAULT 1)"
+    )
+    conn.execute(
+        "INSERT INTO bases (name, url, active) VALUES (?, ?, 1)",
+        ("Старый клиент", "https://msk1.1cfresh.com/a/ea/9"),
+    )
+    conn.commit()
+    conn.close()
+
+    db.init_db()
+
+    got = db.get_base("https://msk1.1cfresh.com/a/ea/9")
+    assert got is not None
+    assert got["name"] == "Старый клиент"
+    assert got["active_doc_types"] == []
+    # Миграция аддитивная: можно сразу записать значения
+    assert db.update_base(got["id"], active_doc_types=["cash_income"]) is True
+    assert db.get_base_by_id(got["id"])["active_doc_types"] == ["cash_income"]
+
+
+def test_base_active_doc_types_corrupt_json_reads_as_empty(clean_db):
+    base = db.insert_base("Клиент", "https://msk1.1cfresh.com/a/ea/1", "u", "p")
+    conn = sqlite3.connect(db._DB_PATH)
+    conn.execute(
+        "UPDATE bases SET active_doc_types = ? WHERE id = ?",
+        ("не json", base["id"]),
+    )
+    conn.commit()
+    conn.close()
+    assert db.get_base_by_id(base["id"])["active_doc_types"] == []
+
+
+def test_base_doc_types_stored_as_json_text(clean_db):
+    base = db.insert_base(
+        "Клиент", "https://msk1.1cfresh.com/a/ea/1", "u", "p",
+        active_doc_types=["bank_incoming"],
+    )
+    conn = sqlite3.connect(db._DB_PATH)
+    raw = conn.execute(
+        "SELECT active_doc_types FROM bases WHERE id = ?", (base["id"],)
+    ).fetchone()[0]
+    conn.close()
+    assert json.loads(raw) == ["bank_incoming"]
 
 
 def test_base_password_plaintext_without_key(clean_db, monkeypatch):

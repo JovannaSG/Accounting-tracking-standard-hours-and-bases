@@ -107,7 +107,10 @@ def init_db():
     Дополнительные поля:
       - sno   — система налогообложения клиента (заполняется вручную,
                 т.к. регистр СНО в OData-составе обычно не публикуется);
-      - group — группа клиентов для отборов по группе.
+      - group — группа клиентов для отборов по группе;
+      - active_doc_types — JSON-список ключей видов документов, которые
+                выгружаются по этой базе; NULL или пустой список означает
+                «выгружать все виды из реестра doc_types.json».
 
     Таблица `norms` — регистр норм трудозатрат (ТЗ §4.1): ключ вида документа,
     категория, наименование, норма в минутах и нормочасах, коэффициент
@@ -151,6 +154,7 @@ def init_db():
             password TEXT,
             sno TEXT,
             "group" TEXT,
+            active_doc_types TEXT,
             created_at TEXT,
             active INTEGER NOT NULL DEFAULT 1
         )
@@ -161,6 +165,8 @@ def init_db():
         cursor.execute("ALTER TABLE bases ADD COLUMN sno TEXT")
     if "group" not in existing:
         cursor.execute('ALTER TABLE bases ADD COLUMN "group" TEXT')
+    if "active_doc_types" not in existing:
+        cursor.execute("ALTER TABLE bases ADD COLUMN active_doc_types TEXT")
 
     # Регистр норм трудозатрат (ТЗ §4.1)
     cursor.execute("""
@@ -383,7 +389,7 @@ def list_users() -> list[dict]:
         {
             "login": r[0],
             "role": r[1],
-            "allowed_urls": _parse_urls(r[2]),
+            "allowed_urls": _parse_json_list(r[2]),
             "active": bool(r[3]),
             "employee_full_name": r[4],
         }
@@ -408,6 +414,33 @@ def delete_user(login: str) -> bool:
 
 
 # =============================== БАЗЫ КЛИЕНТОВ ==============================
+_BASES_SELECT = (
+    "id, name, url, login, password, sno, \"group\", active_doc_types, "
+    "created_at, active"
+)
+
+
+def _base_row(row) -> dict:
+    """
+    Строка таблицы bases -> словарь. Пароль расшифровывается,
+    active_doc_types разбирается из JSON в список ключей видов документов
+    (пустой список = выгружать все виды).
+    """
+
+    return {
+        "id": row[0],
+        "name": row[1],
+        "url": row[2],
+        "login": row[3],
+        "password": _decrypt_password(row[4]),
+        "sno": row[5],
+        "group": row[6],
+        "active_doc_types": _parse_json_list(row[7]),
+        "created_at": row[8],
+        "active": bool(row[9]),
+    }
+
+
 def list_bases(active_only: bool = False) -> list[dict]:
     """
     Базы клиентов (таблица bases). Пароли возвращаются: они нужны
@@ -417,30 +450,14 @@ def list_bases(active_only: bool = False) -> list[dict]:
     init_db()
     conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
-    sql: str = (
-        "SELECT id, name, url, login, password, sno, \"group\", "
-        "created_at, active FROM bases"
-    )
+    sql = f"SELECT {_BASES_SELECT} FROM bases"
     if active_only:
         sql += " WHERE active = 1"
     sql += " ORDER BY name COLLATE NOCASE"
     cursor.execute(sql)
     rows = cursor.fetchall()
     conn.close()
-    return [
-        {
-            "id": r[0],
-            "name": r[1],
-            "url": r[2],
-            "login": r[3],
-            "password": _decrypt_password(r[4]),
-            "sno": r[5],
-            "group": r[6],
-            "created_at": r[7],
-            "active": bool(r[8]),
-        }
-        for r in rows
-    ]
+    return [_base_row(r) for r in rows]
 
 
 def get_base(url: str) -> dict | None:
@@ -454,26 +471,12 @@ def get_base(url: str) -> dict | None:
     conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, name, url, login, password, sno, \"group\", "
-        "created_at, active "
-        "FROM bases WHERE url = ?",
+        f"SELECT {_BASES_SELECT} FROM bases WHERE url = ?",
         (_normalize_url(url),),
     )
     row = cursor.fetchone()
     conn.close()
-    if row is None:
-        return None
-    return {
-        "id": row[0],
-        "name": row[1],
-        "url": row[2],
-        "login": row[3],
-        "password": _decrypt_password(row[4]),
-        "sno": row[5],
-        "group": row[6],
-        "created_at": row[7],
-        "active": bool(row[8]),
-    }
+    return _base_row(row) if row else None
 
 
 def insert_base(
@@ -483,10 +486,13 @@ def insert_base(
     password: str,
     sno: str | None = None,
     group: str | None = None,
+    active_doc_types: list[str] | None = None,
     active: bool = True,
 ) -> dict | None:
     """
     Добавляет базу. URL нормализуется (_normalize_url) и должен быть уникальным.
+    ``active_doc_types`` — ключи видов документов, выгружаемых по этой базе;
+    пустой список означает «выгружать все виды из реестра».
     Возвращает None при совпадении URL с существующей записью.
     """
 
@@ -500,8 +506,8 @@ def insert_base(
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO bases (name, url, login, password, sno, \"group\", "
-        "created_at, active) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "active_doc_types, created_at, active) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             str(name or "").strip(),
             norm,
@@ -509,6 +515,7 @@ def insert_base(
             _encrypt_password(password),
             (str(sno).strip() if sno else None),
             (str(group).strip() if group else None),
+            _dump_doc_types(active_doc_types),
             datetime.now().isoformat(timespec="seconds"),
             int(bool(active)),
         ),
@@ -527,10 +534,12 @@ def update_base(
     password: str | None = None,
     sno: str | None = None,
     group: str | None = None,
+    active_doc_types: list[str] | None = None,
     active: bool | None = None,
 ) -> bool:
     """
     Обновляет поля базы. Пустой password — без изменений пароля.
+    ``active_doc_types=None`` — без изменений; ``[]`` — выгружать все виды.
     Возвращает False, если записи нет или новый URL уже занят.
     """
 
@@ -558,6 +567,11 @@ def update_base(
         new_pass_enc = _encrypt_password(base["password"] or "")
     new_sno = base["sno"] if sno is None else (str(sno).strip() if sno else None)
     new_group = base["group"] if group is None else (str(group).strip() if group else None)
+    new_types = (
+        _dump_doc_types(base["active_doc_types"])
+        if active_doc_types is None
+        else _dump_doc_types(active_doc_types)
+    )
     new_active = base["active"] if active is None else bool(active)
 
     init_db()
@@ -565,14 +579,21 @@ def update_base(
     cursor = conn.cursor()
     cursor.execute(
         "UPDATE bases SET name=?, url=?, login=?, password=?, sno=?, "
-        "\"group\"=?, active=? WHERE id=?",
+        "\"group\"=?, active_doc_types=?, active=? WHERE id=?",
         (new_name, new_url, new_login, new_pass_enc, new_sno, new_group,
-         int(new_active), base_id),
+         new_types, int(new_active), base_id),
     )
     updated = cursor.rowcount > 0
     conn.commit()
     conn.close()
     return updated
+
+
+def _dump_doc_types(keys) -> str | None:
+    """Сериализует список ключей видов документов для колонки TEXT."""
+
+    clean = [str(k).strip() for k in (keys or []) if str(k or "").strip()]
+    return json.dumps(clean, ensure_ascii=False) if clean else None
 
 
 def _raw_password_by_id(base_id: int) -> str | None:
@@ -592,26 +613,12 @@ def get_base_by_id(base_id: int) -> dict | None:
     conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, name, url, login, password, sno, \"group\", "
-        "created_at, active "
-        "FROM bases WHERE id = ?",
+        f"SELECT {_BASES_SELECT} FROM bases WHERE id = ?",
         (base_id,),
     )
     row = cursor.fetchone()
     conn.close()
-    if row is None:
-        return None
-    return {
-        "id": row[0],
-        "name": row[1],
-        "url": row[2],
-        "login": row[3],
-        "password": _decrypt_password(row[4]),
-        "sno": row[5],
-        "group": row[6],
-        "created_at": row[7],
-        "active": bool(row[8]),
-    }
+    return _base_row(row) if row else None
 
 
 def delete_base(base_id: int) -> bool:
@@ -1013,6 +1020,94 @@ def upsert_employee(
     return get_employee(full_name=str(full_name).strip())
 
 
+def update_employee(
+    emp_id: int,
+    full_name: str | None = None,
+    user_1c: str | None = None,
+    role: str | None = None,
+    hours_per_month: float | None = None,
+    comment: str | None = None,
+    active: bool | None = None,
+) -> bool:
+    """
+    Обновляет сотрудника по emp_id. ФИО — изменяемое поле (у человека может
+    смениться имя), поэтому адресация идёт по id, а не по имени: key full_name
+    остаётся UNIQUE только для защиты от дублей.
+
+    None означает «оставить поле без изменений».
+
+    Переименование каскадно правит users.employee_full_name — это мягкий
+    внешний ключ «учётная запись → сотрудник» (ТЗ §11). Без каскада
+    бухгалтер потерял бы привязку и увидел пустой отчёт. Обе правки идут
+    в одной транзакции: при конфликте UNIQUE откатывается и employees,
+    и users.
+
+    Возвращает False, если записи нет, ФИО пустое или новое имя уже занято.
+    """
+
+    emp = get_employee(emp_id=emp_id)
+    if emp is None:
+        return False
+
+    new_name = emp["full_name"] if full_name is None else str(full_name).strip()
+    if not new_name:
+        return False
+    new_user_1c = (
+        emp["user_1c"] if user_1c is None
+        else (str(user_1c).strip() or None)
+    )
+    new_role = emp["role"] if role is None else (str(role).strip() or None)
+    new_hours = (
+        float(emp["hours_per_month"]) if hours_per_month is None
+        else float(hours_per_month)
+    )
+    new_comment = emp["comment"] if comment is None else comment
+    new_active = emp["active"] if active is None else bool(active)
+    old_name = str(emp["full_name"] or "")
+    renamed = new_name.strip().lower() != old_name.strip().lower()
+
+    init_db()
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE employees SET user_1c=?, full_name=?, role=?, "
+            "hours_per_month=?, comment=?, active=? WHERE id=?",
+            (
+                new_user_1c, new_name, new_role, new_hours, new_comment,
+                int(new_active), emp_id,
+            ),
+        )
+        if cursor.rowcount == 0:
+            conn.rollback()
+            return False
+        if renamed:
+            # Сопоставление регистронезависимое, но делаем его в Python,
+            # а не через COLLATE NOCASE: встроенная коллация SQLite
+            # сворачивает регистр только для ASCII, поэтому «ИВАНОВА АННА»
+            # и «Иванова Анна» она считает разными строками.
+            old_key = old_name.strip().lower()
+            cursor.execute(
+                "SELECT login, employee_full_name FROM users "
+                "WHERE employee_full_name IS NOT NULL"
+            )
+            for login, linked in cursor.fetchall():
+                if str(linked or "").strip().lower() == old_key:
+                    cursor.execute(
+                        "UPDATE users SET employee_full_name = ? WHERE login = ?",
+                        (new_name, login),
+                    )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        # Дубль ФИО: откатываем и employees, и users, иначе правка
+        # сотрудника применилась бы, а привязка учётной записи — нет.
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+
 def delete_employee(emp_id: int) -> bool:
     """
     Удаляет сотрудника. Возвращает True при удалении.
@@ -1028,9 +1123,14 @@ def delete_employee(emp_id: int) -> bool:
     return deleted
 
 
-def _parse_urls(raw) -> list:
+def _parse_json_list(raw) -> list:
+    """
+    Разбирает JSON-массив из TEXT-колонки. NULL/мусор -> пустой список.
+    Используется для users.allowed_urls и bases.active_doc_types.
+    """
+
     try:
         parsed = json.loads(raw) if raw else []
-        return parsed if isinstance(parsed, list) else []
+        return [str(v) for v in parsed] if isinstance(parsed, list) else []
     except (TypeError, ValueError):
         return []

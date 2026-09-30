@@ -16,6 +16,7 @@ from core.fetch import fetch_documents, unmapped_user_names
 from core.calculator import (
     build_report,
     build_employee_load,
+    find_missing_norms,
     summarize_totals,
     REPORT_COLUMNS,
     DEFAULT_GROUPING,
@@ -489,9 +490,21 @@ def run_report(
     selected_types: list[str],
     grouping: list[str] | None = None,
 ) -> tuple:
+    """
+    Выгружает документы и строит отчёт.
+
+    ``selected_types`` приходит из блока «Блок операций» в сайдбаре.
+    Настройка базы (active_doc_types) сужает его: список заданной
+    администратором базы — белый список, а блок операций выбирает внутри
+    него. Пустой список у базы означает «выгружать все виды».
+    """
+
+    allow = base.get("active_doc_types") or []
+    types = [k for k in selected_types if k in allow] if allow else list(selected_types)
+
     client = OneCClient(base["url"], base["login"], base["password"])
     raw = fetch_documents(
-        client, period_start, period_end, selected_types,
+        client, period_start, period_end, types,
         sno=(base.get("sno") or ""),
     )
     report = build_report(raw, grouping=grouping)
@@ -626,6 +639,19 @@ def render_report_tab(base: dict):
             for s in cached["skipped"]:
                 st.warning(s)
 
+    # Предупреждение о незаполненных нормах (ТЗ §4.1). Считаем по сырым
+    # данным: apply_norms_and_employees пересобирает фрейм и теряет attrs,
+    # а отчёт заново строится из кэша при каждом rerun.
+    missing_norms = find_missing_norms(cached["raw"])
+    if missing_norms and user_role() != auth.ROLE_ACCOUNTANT:
+        st.warning(
+            "Внимание: нормы трудозатрат не заданы для следующих видов "
+            "документов — они посчитаны с нормой 0:"
+        )
+        st.markdown(
+            "\n".join(f"- {name}" for name in missing_norms)
+        )
+
     if v_spec.get("info"):
         st.info(v_spec["info"])
     if filtered.empty:
@@ -649,13 +675,21 @@ def render_report_tab(base: dict):
         with st.expander("Не распределены (нет записи в сотрудниках)"):
             st.write(", ".join(unmapped))
 
-    st.sidebar.header("Выгрузка Excel")
-    excel = export_excel(filtered, filtered_detail, emp_load, totals)
-    st.sidebar.download_button(
-        "Скачать Excel (.xlsx)", excel,
-        file_name=f"normirovanie_{cached['period_label'].replace('.', '_')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    # Панель действий под данными: сайдбар остаётся только вводом и
+    # отборами, а выгрузка и сброс — рядом с самим отчётом.
+    st.markdown("---")
+    col_export, col_clear = st.columns(2)
+    with col_export:
+        excel = export_excel(filtered, filtered_detail, emp_load, totals)
+        st.download_button(
+            "Скачать Excel (.xlsx)", excel,
+            file_name=f"normirovanie_{cached['period_label'].replace('.', '_')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with col_clear:
+        if st.button("Очистить отчёт", key="clear_report_btn", use_container_width=True):
+            st.session_state.pop("last_result", None)
+            st.rerun()
 
 
 def render_diagnostics_tab(base: dict):
@@ -753,6 +787,69 @@ def render_norms_tab():
                 st.rerun()
 
     st.markdown("---")
+    st.subheader("Новый вид документа")
+    st.caption(
+        "Для вида, которого нет в реестре: заведите норму вручную, чтобы "
+        "документы перестали попадать в предупреждение об отсутствии норм. "
+        "После этого вид появится в редакторе выше."
+    )
+    with st.form("new_norm_form"):
+        n_doc_type = st.text_input(
+            "Ключ вида документа (doc_type)",
+            key="new_norm_type",
+            help="Латиницей, уникально. Например: act_sverki.",
+        ).strip()
+        n_title = st.text_input(
+            "Наименование для отчёта", key="new_norm_title"
+        ).strip()
+        n_category = st.text_input(
+            "Категория (блок операций)", key="new_norm_category"
+        ).strip()
+        n_entity = st.text_input(
+            "OData-сущность", key="new_norm_entity",
+            placeholder="Document_АктСверкиВзаиморасчетов",
+        ).strip()
+        n_unit = st.selectbox(
+            "Единица измерения",
+            ["документ", "операция", "запись", "отчет", "акт", "объект",
+             "сотрудник", "пакет"],
+            key="new_norm_unit",
+        )
+        n_min = st.number_input(
+            "Норма, минут на единицу", min_value=0.0, step=0.5,
+            key="new_norm_min",
+        )
+        n_coeff = st.number_input(
+            "Коэффициент сложности", min_value=0.0, step=0.05, value=1.0,
+            key="new_norm_coeff",
+        )
+        n_comment = st.text_input(
+            "Комментарий", key="new_norm_comment"
+        ).strip()
+        n_save = st.form_submit_button("Создать норму")
+        if n_save:
+            if not n_doc_type or not n_title:
+                st.error("Заполните «Ключ вида документа» и «Наименование».")
+            elif db.get_norm(doc_type=n_doc_type) is not None:
+                st.error(
+                    f"Вид с ключом «{n_doc_type}» уже есть — "
+                    "отредактируйте его в блоке выше."
+                )
+            else:
+                db.upsert_norm(
+                    doc_type=n_doc_type,
+                    category=n_category,
+                    title=n_title,
+                    entity=n_entity,
+                    unit=n_unit,
+                    norm_min=n_min,
+                    coeff=n_coeff,
+                    comment=n_comment or None,
+                )
+                st.success(f"Вид «{n_title}» добавлен")
+                st.rerun()
+
+    st.markdown("---")
     st.subheader("Действия")
     if st.button("Засеять нормы по умолчанию"):
         inserted = seed_default_norms()
@@ -760,6 +857,31 @@ def render_norms_tab():
 
 
 # bases: list[dict]
+EMPLOYEE_ROLES: list[str] = [
+    "Бухгалтер по первичке", "Бухгалтер", "Главный бухгалтер",
+    "Руководитель проекта", "",
+]
+
+
+def _employee_label(emp: dict) -> str:
+    alias = f" · {emp['user_1c']}" if emp.get("user_1c") else ""
+    mark = "" if emp.get("active") else " (выключен)"
+    return f"{emp['full_name']}{alias}{mark}"
+
+
+def _emp_edit_key(field: str, emp_id: int) -> str:
+    """
+    Ключ виджета формы правки сотрудника — с id выбранного сотрудника.
+
+    Виджет с явным key хранит значение в session_state, и на следующих
+    прогонах переданный в код value игнорируется. С ключом без id форма
+    продолжила бы показывать (и сохранять) данные предыдущего сотрудника
+    после переключения селектора.
+    """
+
+    return f"emp_edit_{field}_{emp_id}"
+
+
 def render_employees_tab():
     st.title("Сотрудники аутсорсера")
     if not _permission_flag("can_manage_employees"):
@@ -770,15 +892,18 @@ def render_employees_tab():
         st.dataframe(pd.DataFrame(employees))
 
     st.markdown("---")
-    st.subheader("Новый/изменение сотрудника")
-    full_name = st.text_input("ФИО (ключ сотрудника)").strip()
-    user_1c = st.text_input("Пользователь 1С (алиас, опц.)").strip()
-    role = st.selectbox("Роль сотрудника", [
-        "Бухгалтер по первичке", "Бухгалтер", "Главный бухгалтер",
-        "Руководитель проекта", "",
-    ])
-    hours = st.number_input("Фонд часов в месяц", min_value=1.0, value=130.0)
-    if st.button("Сохранить сотрудника"):
+    st.subheader("Новый сотрудник")
+    full_name = st.text_input("ФИО (ключ сотрудника)", key="emp_new_name").strip()
+    user_1c = st.text_input(
+        "Пользователь 1С (алиас, опц.)", key="emp_new_user1c"
+    ).strip()
+    role = st.selectbox(
+        "Роль сотрудника", EMPLOYEE_ROLES, key="emp_new_role"
+    )
+    hours = st.number_input(
+        "Фонд часов в месяц", min_value=1.0, value=130.0, key="emp_new_hours"
+    )
+    if st.button("Добавить сотрудника", key="emp_add_btn"):
         if not full_name:
             st.error("Заполните «ФИО».")
         else:
@@ -788,6 +913,68 @@ def render_employees_tab():
             )
             st.success("Сохранено")
             st.rerun()
+
+    st.markdown("---")
+    st.subheader("Редактирование")
+    # Выбор по id, а не по ФИО: ФИО изменяемо, и два сотрудника могут
+    # отличаться только регистром — словарь с ключом full_name схлопнул бы их.
+    if employees:
+        pick_id = st.selectbox(
+            "Сотрудник",
+            [e["id"] for e in employees],
+            format_func=lambda i: _employee_label(
+                next(x for x in employees if x["id"] == i)
+            ),
+            key="emp_edit_pick",
+        )
+        emp = db.get_employee(emp_id=pick_id) or {}
+        with st.form("edit_employee"):
+            name2 = st.text_input(
+                "ФИО", value=emp.get("full_name") or "",
+                key=_emp_edit_key("name", pick_id),
+            )
+            user1c2 = st.text_input(
+                "Пользователь 1С (алиас)", value=emp.get("user_1c") or "",
+                key=_emp_edit_key("user1c", pick_id),
+            )
+            role2 = st.selectbox(
+                "Роль сотрудника", EMPLOYEE_ROLES,
+                index=EMPLOYEE_ROLES.index(emp.get("role") or "")
+                if (emp.get("role") or "") in EMPLOYEE_ROLES else 0,
+                key=_emp_edit_key("role", pick_id),
+            )
+            hours2 = st.number_input(
+                "Фонд часов в месяц", min_value=1.0,
+                value=float(emp.get("hours_per_month") or 130.0),
+                key=_emp_edit_key("hours", pick_id),
+            )
+            active2 = st.checkbox(
+                "Сотрудник активен", value=bool(emp.get("active")),
+                key=_emp_edit_key("active", pick_id),
+            )
+            save2 = st.form_submit_button("Сохранить изменения")
+            if save2:
+                if not name2.strip():
+                    st.error("Заполните «ФИО».")
+                else:
+                    ok = db.update_employee(
+                        pick_id,
+                        full_name=name2.strip(),
+                        user_1c=user1c2.strip() or None,
+                        role=role2 or None,
+                        hours_per_month=hours2,
+                        active=active2,
+                    )
+                    if ok:
+                        st.success("Сохранено")
+                        st.rerun()
+                    else:
+                        st.error(
+                            "Не удалось сохранить: ФИО уже занято другим "
+                            "сотрудником."
+                        )
+    else:
+        st.info("Сотрудников пока нет — добавьте первого выше.")
 
     st.markdown("---")
     st.subheader("Массовый импорт по ФИО")
@@ -806,10 +993,15 @@ def render_employees_tab():
     st.subheader("Удаление")
     existing = [e for e in employees]
     if existing:
-        by_id = {e['full_name']: e["id"] for e in existing}
-        pick = st.selectbox("Сотрудник", list(by_id.keys()))
-        if st.button("Удалить"):
-            db.delete_employee(by_id[pick])
+        del_id = st.selectbox(
+            "Сотрудник", [e["id"] for e in existing],
+            format_func=lambda i: _employee_label(
+                next(x for x in existing if x["id"] == i)
+            ),
+            key="emp_del_pick",
+        )
+        if st.button("Удалить", key="emp_del_btn"):
+            db.delete_employee(del_id)
             st.success("Удалено")
             st.rerun()
 
@@ -826,7 +1018,8 @@ def render_bases_tab():
         )
     else:
         st.dataframe(pd.DataFrame(bases)[
-            ["id", "name", "url", "sno", "group", "active"]])
+            ["id", "name", "url", "sno", "group", "active_doc_types",
+             "active"]])
 
     if not can_edit:
         st.caption(
@@ -834,6 +1027,13 @@ def render_bases_tab():
             "Добавление и реквизиты доступны администратору."
         )
         return
+
+    doc_types = load_doc_types()
+    dt_keys = list(doc_types.keys())
+
+    def dt_label(k: str) -> str:
+        spec = doc_types[k]
+        return f"{spec.get('title', k)} · {spec.get('category', '')}"
 
     st.markdown("---")
     st.subheader("Новая база")
@@ -844,13 +1044,20 @@ def render_bases_tab():
         password = st.text_input("Пароль OData", type="password")
         sno = st.text_input("Система налогообложения (вручную)")
         group = st.text_input("Группа клиентов (опц.)")
+        new_types = st.multiselect(
+            "Виды документов этой базы (пусто = все)", dt_keys,
+            format_func=dt_label, key="add_base_types",
+            help="Пустой список — выгружать все виды из doc_types.json.",
+        )
         submitted = st.form_submit_button("Добавить")
         if submitted:
             if not name or not url:
                 st.error("Укажите название и URL.")
             else:
                 base = db.insert_base(
-                    name, url, login, password, sno=sno or None, group=group or None)
+                    name, url, login, password, sno=sno or None,
+                    group=group or None, active_doc_types=new_types,
+                )
                 if base is None:
                     st.warning("Такая база уже есть.")
                 else:
@@ -863,7 +1070,7 @@ def render_bases_tab():
     if bases:
         pick = st.selectbox(
             "База", [(b["name"], b["id"]) for b in bases],
-            format_func=lambda x: x[0]
+            format_func=lambda x: x[0], key="edit_base_pick"
         )
         b = next((x for x in bases if x["id"] == pick[1]), None)
         with st.form("edit_base"):
@@ -871,6 +1078,12 @@ def render_bases_tab():
             url2 = st.text_input("URL", value=b["url"])
             sno2 = st.text_input("СНО", value=b["sno"] or "")
             group2 = st.text_input("Группа", value=b["group"] or "")
+            types2 = st.multiselect(
+                "Виды документов этой базы (пусто = все)", dt_keys,
+                default=[k for k in b["active_doc_types"] if k in dt_keys],
+                format_func=dt_label, key="edit_base_types",
+                help="Пустой список — выгружать все виды из doc_types.json.",
+            )
             password2 = st.text_input(
                 "Новый пароль (пусто = без изменений)",
                 type="password"
@@ -879,7 +1092,7 @@ def render_bases_tab():
             if submitted2:
                 db.update_base(
                     b["id"], name=name2, url=url2, sno=sno2,
-                    group=group2,
+                    group=group2, active_doc_types=types2,
                     password=password2 or None
                 )
                 st.success("Обновлено")

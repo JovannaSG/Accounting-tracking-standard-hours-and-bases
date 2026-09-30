@@ -81,6 +81,43 @@ def _match_by_entity(rec, norms: dict) -> dict | None:
     return None
 
 
+def find_missing_norms(df: pd.DataFrame) -> list[str]:
+    """
+    Виды документов, для которых норма не задана (ТЗ §4.1).
+
+    «Не задана» — это норма, которая не найдена в реестре/выключена
+    администратором, либо равна нулю. Нулевая норма в DEFAULT_NORMS_HOURS
+    означает ровно то же самое: norms.py заводит её как заглушку с
+    комментарием «Норма не задана в ТЗ» (см. writeoff_materials_from_use,
+    return_customer).
+
+    Принимает сырой DataFrame от fetch_documents, а не агрегированный отчёт:
+    apply_norms_and_employees пересобирает фрейм через
+    ``pd.DataFrame(rows, columns=...)``, что теряет df.attrs, поэтому
+    прокидывать список через атрибут нельзя.
+
+    Возвращает отсортированный список наименований без дублей.
+    """
+
+    if df is None or df.empty:
+        return []
+
+    norms = {n["doc_type"]: n for n in db.list_norms(active_only=True)}
+    by_title: dict[str, dict] = {}
+    for n in norms.values():
+        by_title.setdefault(n["title"], n)
+
+    missing: set[str] = set()
+    for title in df.get("Вид документа", pd.Series(dtype=str)).dropna():
+        name = str(title).strip()
+        if not name:
+            continue
+        norm = by_title.get(name)
+        if norm is None or float(norm.get("norm_hours") or 0.0) == 0.0:
+            missing.add(name)
+    return sorted(missing)
+
+
 def build_report(
     df: pd.DataFrame,
     grouping: list[str] | None = None,

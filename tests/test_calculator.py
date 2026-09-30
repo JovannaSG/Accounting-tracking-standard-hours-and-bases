@@ -5,6 +5,7 @@ from core import db
 from core.calculator import (
     build_report,
     build_employee_load,
+    find_missing_norms,
     summarize_totals,
 )
 
@@ -212,3 +213,64 @@ def test_default_sort_order_tz_9_2(with_norms_and_employees):
         ).dropna()
     )
     assert alpha_hours == sorted(alpha_hours, reverse=True)
+
+# ================== ПРЕДУПРЕЖДЕНИЕ О НЕЗАДАННЫХ НОРМАХ (ТЗ §4.1) ==========
+
+def test_find_missing_norms_detects_unknown_title(with_norms_and_employees):
+    raw = _df([
+        _row(),
+        _row(**{"Вид документа": "Счёт покупателю"}),
+        _row(**{"Вид документа": "Счёт покупателю"}),
+    ])
+    # «Поступление на расчетный счет» нормировано, «Счёт покупателю» — нет
+    assert find_missing_norms(raw) == ["Счёт покупателю"]
+
+
+def test_find_missing_norms_detects_zero_norm(with_norms_and_employees):
+    """Ноль в DEFAULT_NORMS_HOURS — это заглушка «норма не задана»."""
+    db.upsert_norm(
+        doc_type="return_customer", category="Первичные документы",
+        title="Возврат товаров от покупателя",
+        entity="Document_ВозвратТоваровОтПокупателя", norm_hours=0.0,
+    )
+    raw = _df([
+        _row(),
+        _row(**{"Вид документа": "Возврат товаров от покупателя"}),
+    ])
+    assert find_missing_norms(raw) == ["Возврат товаров от покупателя"]
+
+
+def test_find_missing_norms_detects_inactive_norm(with_norms_and_employees):
+    db.upsert_norm(
+        doc_type="payment_order", category="Банк и касса",
+        title="Платежное поручение", entity="Document_ПлатежноеПоручение",
+        norm_hours=0.06, active=False,
+    )
+    raw = _df([_row(**{"Вид документа": "Платежное поручение"})])
+    # Выключенная администратором норма не участвует в расчёте
+    assert find_missing_norms(raw) == ["Платежное поручение"]
+
+
+def test_find_missing_norms_empty_when_all_normed(with_norms_and_employees):
+    raw = _df([
+        _row(),
+        _row(**{"Вид документа": "Авансовый отчет"}),
+    ])
+    assert find_missing_norms(raw) == []
+
+
+def test_find_missing_norms_sorted_unique_and_tolerates_empty(with_norms_and_employees):
+    raw = _df([
+        _row(**{"Вид документа": "Ящик"}),
+        _row(**{"Вид документа": "Акт"}),
+        _row(**{"Вид документа": "Акт"}),
+    ])
+    assert find_missing_norms(raw) == ["Акт", "Ящик"]
+    assert find_missing_norms(pd.DataFrame()) == []
+    assert find_missing_norms(None) == []
+
+
+def test_find_missing_norms_works_on_aggregated_report(with_norms_and_employees):
+    """Агрегация не теряет вид документа — список остаётся тем же."""
+    raw = _df([_row(), _row(**{"Вид документа": "Счёт покупателю"})])
+    assert find_missing_norms(build_report(raw)) == ["Счёт покупателю"]
