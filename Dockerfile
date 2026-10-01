@@ -8,7 +8,7 @@ ENV PYTHONUNBUFFERED=1 \
     AUDIT_DB_PATH=/data/norm_hours.db \
     AUDIT_USERS_CONFIG=/data/users.json \
     UI_HOST=0.0.0.0 \
-    UI_PORT=8502
+    UI_PORT=8503
 
 WORKDIR /app
 
@@ -18,15 +18,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY core ./core
+COPY docker/entrypoint.sh /usr/local/bin/audit-entrypoint.sh
+RUN chmod +x /usr/local/bin/audit-entrypoint.sh
 
-# Рабочие данные (БД + конфиг пользователей) хранятся в /data.
-# Это каталог тома docker-compose: при первом запуске в него копируется
-# содержимое из образа, поэтому кладём сюда стартовый конфиг.
-RUN mkdir -p /data && cp users.example.json /data/users.json
+# Рабочие данные (БД + конфиг пользователей) лежат в томе на /data.
+# Конфиг пользователей НЕ создаётся автоматически: entrypoint завершает
+# контейнер, если /data/users.json отсутствует, нечитаем или пуст — иначе
+# приложение стартовало бы без аутентификации в доступной по сети порту.
+# См. «Первый запуск» в руководстве: docker cp users.json norm-hours:/data/users.json
+RUN mkdir -p /data
 
-EXPOSE 8502
+EXPOSE 8503
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8502/_stcore/health', timeout=3)" || exit 1
+    CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8503/_stcore/health', timeout=3)" || exit 1
 
-CMD ["python", "app/run.py"]
+CMD ["/usr/local/bin/audit-entrypoint.sh", "python", "app/run.py"]

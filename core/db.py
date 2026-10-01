@@ -3,6 +3,7 @@ import sqlite3
 import json
 import os
 import secrets
+import sys
 from datetime import datetime
 
 # Позволяем тестам использовать временный файл через переменную окружения
@@ -232,12 +233,38 @@ def load_users_config() -> dict:
         if not os.path.exists(path):
             continue
         try:
-            with open(path, encoding="utf-8") as f:
+            # utf-8-sig: файл часто правят в «Блокноте» или через PowerShell
+            # 5.1, и такой редактор добавляет BOM, который utf-8 не читает.
+            with open(path, encoding="utf-8-sig") as f:
                 data = json.load(f)
         except (OSError, ValueError):
             continue
         return data if isinstance(data, dict) else {}
     return {}
+
+
+def _looks_like_pbkdf2(value: str) -> bool:
+    """
+    Проверяет, что строка похожа на хэш приложения, а не на плейсхолдер.
+
+    Формат ровно тот, что выдаёт `core.auth.hash_password()`:
+    `<итерации>$<соль hex>$<дайджест hex>`. Проверка нужна, чтобы шаблон
+    users.json не создавал учётную запись, в которую невозможно войти:
+    `core.auth._verify_stored_hash()` вернёт False на любом другом формате.
+    """
+
+    parts = str(value or "").split("$")
+    if len(parts) != 3:
+        return False
+    iterations, salt, digest = parts
+    hex_digits = "0123456789abcdefABCDEF"
+    return (
+        iterations.isdigit()
+        and int(iterations) >= 1000
+        and len(salt) >= 16
+        and len(digest) == 64
+        and all(c in hex_digits for c in salt + digest)
+    )
 
 
 def _seed_users_from_config(cursor) -> None:
@@ -258,6 +285,15 @@ def _seed_users_from_config(cursor) -> None:
             or ""
         ).strip()
         if not pwd_hash:
+            continue
+        if not _looks_like_pbkdf2(pwd_hash):
+            print(
+                f"[users.json] пропущен '{login.strip().lower()}': ожидается "
+                f"хэш вида <итерации>$<соль>$<дайджест> — сгенерируйте его "
+                f"командой 'python -m core.auth hash <пароль>'; получено: "
+                f"{pwd_hash[:24]}",
+                file=sys.stderr,
+            )
             continue
 
         allowed = spec.get("allowed_urls") or []

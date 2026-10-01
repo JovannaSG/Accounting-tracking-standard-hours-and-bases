@@ -6,7 +6,7 @@ from unittest import mock
 
 import pytest
 
-from core import db
+from core import auth, db
 
 
 def test_users_config_falls_back_to_user_json(monkeypatch):
@@ -29,6 +29,106 @@ def test_no_users_config_returns_empty(monkeypatch):
     tmp = tempfile.mkdtemp(prefix="cfg_test_")
     monkeypatch.setattr(db, "USERS_CONFIG_PATH", os.path.join(tmp, "users.json"))
     assert db.load_users_config() == {}
+
+
+def _write_users_config(tmp, payload):
+    path = os.path.join(tmp, "users.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    return path
+
+
+def test_seed_skips_placeholder_hash_and_warns(clean_db, monkeypatch, capsys):
+    """Плейсхолдер из users.example.json не должен создавать нелогинябельного юзера."""
+    tmp = tempfile.mkdtemp(prefix="seed_placeholder_")
+    monkeypatch.setattr(
+        db,
+        "USERS_CONFIG_PATH",
+        _write_users_config(
+            tmp,
+            {"admin": {"role": "admin", "password": "ЗАМЕНИТЕ_НА_ХЭШ"}},
+        ),
+    )
+
+    db.init_db()
+
+    assert db.get_user("admin") is None
+    warning = capsys.readouterr().err
+    assert "admin" in warning
+    assert "core.auth hash" in warning
+
+
+def test_seed_creates_user_from_real_hash_and_login_works(clean_db, monkeypatch):
+    """Хэш из core.auth.hash_password() принимается, и вход по нему проходит."""
+    tmp = tempfile.mkdtemp(prefix="seed_real_hash_")
+    monkeypatch.setattr(
+        db,
+        "USERS_CONFIG_PATH",
+        _write_users_config(
+            tmp,
+            {
+                "admin": {
+                    "role": "admin",
+                    "password_hash": auth.hash_password("СекретныйПароль123"),
+                }
+            },
+        ),
+    )
+
+    db.init_db()
+
+    row = db.get_user("admin")
+    assert row is not None
+    assert row["role"] == "admin"
+    assert auth.verify("admin", "СекретныйПароль123")
+    assert not auth.verify("admin", "неверный")
+
+
+def test_seed_accepts_users_json_with_utf8_bom(clean_db, monkeypatch):
+    """BOM от «Блокнота»/PowerShell не должен ломать посев пользователей."""
+    tmp = tempfile.mkdtemp(prefix="seed_bom_")
+    path = os.path.join(tmp, "users.json")
+    with open(path, "w", encoding="utf-8-sig") as f:
+        json.dump(
+            {"admin": {"role": "admin", "password_hash": auth.hash_password("ПарольСBom1")}},
+            f,
+            ensure_ascii=False,
+        )
+    monkeypatch.setattr(db, "USERS_CONFIG_PATH", path)
+
+    db.init_db()
+
+    assert db.get_user("admin") is not None
+    assert auth.verify("admin", "ПарольСBom1")
+
+
+def test_reseed_does_not_overwrite_existing_user(clean_db, monkeypatch):
+    """users.json применяется только пока таблица users пуста."""
+    tmp = tempfile.mkdtemp(prefix="seed_once_")
+    monkeypatch.setattr(
+        db,
+        "USERS_CONFIG_PATH",
+        _write_users_config(
+            tmp,
+            {"admin": {"role": "admin", "password_hash": auth.hash_password("ПервыйПароль1")}},
+        ),
+    )
+    db.init_db()
+    first_hash = db.get_user("admin")["password_hash"]
+
+    monkeypatch.setattr(
+        db,
+        "USERS_CONFIG_PATH",
+        _write_users_config(
+            tmp,
+            {"admin": {"role": "admin", "password_hash": auth.hash_password("ВторойПароль2")}},
+        ),
+    )
+    db.init_db()
+
+    assert db.get_user("admin")["password_hash"] == first_hash
+    assert auth.verify("admin", "ПервыйПароль1")
+    assert not auth.verify("admin", "ВторойПароль2")
 
 
 def test_users_employee_full_name_additive_migration(monkeypatch):

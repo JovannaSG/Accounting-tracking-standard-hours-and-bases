@@ -35,7 +35,7 @@ def _load_schema() -> dict[str, Any]:
         with _schema_lock:
             if _schema_cache is None:
                 try:
-                    with open(_SCHEMA_PATH, encoding="utf-8") as f:
+                    with open(_SCHEMA_PATH, encoding="utf-8-sig") as f:
                         _schema_cache = json.load(f)
                 except (OSError, ValueError):
                     _schema_cache = {}

@@ -47,7 +47,9 @@ def load_doc_types() -> dict:
     if not os.path.exists(DOC_TYPES_PATH):
         return {}
     try:
-        with open(DOC_TYPES_PATH, encoding="utf-8") as f:
+        # Реестр видов документов правят вручную в «Блокноте» и PowerShell,
+        # которые добавляют BOM — utf-8-sig читает оба варианта.
+        with open(DOC_TYPES_PATH, encoding="utf-8-sig") as f:
             data = json.load(f)
     except (OSError, ValueError):
         return {}

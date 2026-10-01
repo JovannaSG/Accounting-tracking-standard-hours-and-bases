@@ -5,7 +5,10 @@ services:
       dockerfile: Dockerfile
     image: norm-hours:latest
     container_name: norm-hours
-    restart: unless-stopped
+    # on-failure:3 — контейнер не стартует без users.json (см. entrypoint).
+    # Не используем unless-stopped: при отсутствующем конфиге он давал бы
+    # бесконечный цикл перезапусков, шумящий в логах и нагружающий CPU.
+    restart: on-failure:3
     ports:
       # "ХОСТ:КОНТЕЙНЕР". Внешний порт выберите свободный на этой ВМ
       # (для второго экземпляра, например, "8504:8503").

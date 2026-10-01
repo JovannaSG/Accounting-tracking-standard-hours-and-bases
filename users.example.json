@@ -1,7 +1,7 @@
 {
   "admin": {
     "role": "admin",
-    "password": "admin_example_change_me"
+    "password": "ЗАМЕНИТЕ_НА_ХЭШ_из_python_-m_core.auth_hash"
   },
   "buhgalter": {
     "role": "accountant",
