@@ -27,32 +27,81 @@ USERS_CONFIG_PATH = os.environ.get(
 # Шифрование паролей клиентских баз. Ключ — переменная окружения
 # AUDIT_DB_SECRET_KEY (base64 от 32 случайных байт). Без ключа пароли
 # хранятся как раньше, в открытом виде (обратная совместимость).
+#
+# Если ключ ЗАДАН, но непригоден, шифрование не отключается молча: это
+# привело бы к записи паролей в открытом виде и к «пустым» паролям при
+# чтении. Вместо этого поднимается SecretKeyError с указанием причины.
 _SECRET_KEY_ENV = "AUDIT_DB_SECRET_KEY"
 _ENC_PREFIX = "enc:v1:"
 _SECRET_CACHE: dict[str, object] = {}
 
 
+class SecretKeyError(RuntimeError):
+    """
+    AUDIT_DB_SECRET_KEY задан, но не является корректным ключом Fernet.
+    """
+
+
 def _get_fernet():
     """
-    Возвращает объект Fernet по ключу из окружения или None.
-    Ключ кэшируется; библиотека cryptography опциональна — если её нет,
-    шифрование отключается (пароль хранится как раньше).
+    Возвращает объект Fernet по ключу из окружения или None (ключ не задан).
+
+    Если ключ задан, но непригоден (опечатка, не base64 от 32 байт, не
+    установлен cryptography), поднимает SecretKeyError. Молча выключать
+    шифрование нельзя: молчаливый откат записал бы пароли открытым текстом
+    и превратил бы опечатку в ключе в трудно диагностируемую потерю паролей.
+    Ключ кэшируется вместе с ошибкой, чтобы не перебирать его на каждый вызов.
     """
 
     if "fernet" in _SECRET_CACHE:
-        return _SECRET_CACHE["fernet"]
+        cached = _SECRET_CACHE["fernet"]
+        if isinstance(cached, SecretKeyError):
+            raise cached
+        return cached
 
-    fernet = None
     raw_key = (os.environ.get(_SECRET_KEY_ENV) or "").strip()
-    if raw_key:
-        try:
-            from cryptography.fernet import Fernet
+    if not raw_key:
+        _SECRET_CACHE["fernet"] = None
+        return None
 
-            fernet = Fernet(raw_key.encode("utf-8"))
-        except Exception:
-            fernet = None
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError as e:
+        err = SecretKeyError(
+            f"{_SECRET_KEY_ENV} задан, но не установлен пакет cryptography — "
+            "зашифровать пароли нечем. Установите cryptography "
+            "(pip install cryptography) или уберите ключ из окружения."
+        )
+        err.__cause__ = e
+        _SECRET_CACHE["fernet"] = err
+        raise err
+
+    try:
+        fernet = Fernet(raw_key.encode("utf-8"))
+    except Exception as e:
+        err = SecretKeyError(
+            f"{_SECRET_KEY_ENV} не является корректным ключом Fernet: {e}. "
+            "Ожидается base64 от 32 случайных байт, например "
+            "'python -c \"import base64,secrets; "
+            "print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())\"'. "
+            "Пока ключ неверен, приложение не сохранит пароли в открытом виде."
+        )
+        err.__cause__ = e
+        _SECRET_CACHE["fernet"] = err
+        raise err
+
     _SECRET_CACHE["fernet"] = fernet
     return fernet
+
+
+def _secret_key_is_broken() -> bool:
+    """True, если ключ задан, но непригоден (без исключения наружу)."""
+
+    try:
+        _get_fernet()
+    except SecretKeyError:
+        return True
+    return False
 
 
 def generate_secret_key() -> str:
@@ -80,21 +129,33 @@ def _encrypt_password(password: str) -> str:
 
 def _decrypt_password(stored: str) -> str:
     """
-    Расшифровывает пароль. Записи в открытом виде (legacy, без префикса)
-    и нерасшифрованные токены (если ключ пропал) возвращаются как есть.
+    Расшифровывает пароль.
+
+    Записи в открытом виде (legacy, без префикса) возвращаются как есть —
+    это позволяет включить ключ на базе, где часть паролей ещё не
+    пересохранена.
+
+    Если значение зашифровано, а ключ не задан, пароль недоступен: раньше
+    здесь возвращалась пустая строка, и ошибка выглядела как «пароль базы
+    потерялся». Теперь при непригодном ключе поднимается SecretKeyError с
+    причиной, а при отсутствии ключа — тот же класс ошибки с понятным текстом.
     """
 
     raw = str(stored or "")
     if not raw.startswith(_ENC_PREFIX):
         return raw
-    fernet = _get_fernet()
+    fernet = _get_fernet()  # SecretKeyError, если ключ задан, но неверен
     if fernet is None:
         return ""
     token = raw[len(_ENC_PREFIX):]
     try:
         return fernet.decrypt(token.encode("utf-8")).decode("utf-8")
-    except Exception:
-        return ""
+    except Exception as e:
+        raise SecretKeyError(
+            f"Пароль базы зашифрован, но не расшифровывается ({e}). "
+            "Похоже, значение в другой БД было сохранено с другим "
+            f"{_SECRET_KEY_ENV}."
+        ) from e
 
 
 def init_db():
@@ -581,7 +642,13 @@ def update_base(
 
     from core.auth import _normalize_url
 
-    base = get_base_by_id(base_id)
+    try:
+        base = get_base_by_id(base_id)
+    except SecretKeyError:
+        # Пароль в БД зашифрован не тем ключом. Остальные поля править можно:
+        # токен останется нетронутым (stored_raw ниже), иначе администратор не
+        # смог бы починить СНО или виды документов, не зная ключа.
+        base = _raw_base_by_id(base_id)
     if base is None:
         return False
 
@@ -632,6 +699,37 @@ def _dump_doc_types(keys) -> str | None:
     return json.dumps(clean, ensure_ascii=False) if clean else None
 
 
+def _raw_base_by_id(base_id: int):
+    """
+    Возвращает словарь полей bases по id с паролем как в БД (без
+    расшифровки) — нужен, чтобы править остальные поля, когда ключ
+    шифрования не подходит к уже сохранённым токенам.
+    """
+
+    init_db()
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
+    cursor = conn.cursor()
+    cursor.execute(
+        f"SELECT {_BASES_SELECT} FROM bases WHERE id = ?", (base_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "name": row[1],
+        "url": row[2],
+        "login": row[3],
+        "password": row[4],  # токен как есть, без расшифровки
+        "sno": row[5],
+        "group": row[6],
+        "active_doc_types": _parse_json_list(row[7]),
+        "created_at": row[8],
+        "active": bool(row[9]),
+    }
+
+
 def _raw_password_by_id(base_id: int) -> str | None:
     """Возвращает пароль из БД как есть (без расшифровки)"""
 
@@ -672,40 +770,201 @@ def delete_base(base_id: int) -> bool:
     return deleted
 
 
-def merge_bases(db_bases: list[dict], file_entries: list[dict]) -> list[dict]:
+# ============================ ИМПОРТ БАЗ ===================================
+# client_databases.json (или .csv) — выгрузка 1С из клиентских баз. Формат
+# каждой записи: {"name": ..., "url": ..., "login": ..., "password": ...}.
+# Файл содержит учётные данные и НИКОГДА не коммитится (см. .gitignore).
+_IMPORT_FIELD_ALIASES = {
+    "name": ("name", "название", "имя", "база", "наименование"),
+    "url": ("url", "ссылка", "адрес", "адресикс", "server"),
+    "login": ("login", "логин", "пользователь", "user", "username"),
+    "password": ("password", "пароль", "pass"),
+}
+
+
+def _clean_str(value, key: str) -> str:
+    """Мелкая очистка значения из файла: пробелы, NBSP, пустые -> ''. """
+
+    text = str(value if value is not None else "")
+    return text.replace("\xa0", " ").strip()
+
+
+def _normalize_row_key(value) -> str:
     """
-    Объединяет базы из БД (таблица bases) и из client_databases.json,
-    дедуплицируя по нормализованному URL. База из БД приоритетнее файла.
-    Возвращает список словарей с ключами {name, url, login, password}.
+    Приводит заголовок столбца к каноническому виду для сопоставления
+    с полями импорта: регистр, пробелы, «ё» и лишние символы игнорируются.
     """
 
+    text = _clean_str(value, "key").lower().replace("ё", "е")
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+def _map_import_field(header) -> str | None:
+    """
+    Возвращает каноническое поле импорта по заголовку столбца
+    или None, если заголовок не распознан.
+    """
+
+    key = _normalize_row_key(header)
+    if not key:
+        return None
+    for field, aliases in _IMPORT_FIELD_ALIASES.items():
+        if key in {_normalize_row_key(a) for a in aliases}:
+            return field
+    return None
+
+
+def _normalize_import_row(record) -> dict:
+    """
+    Приводит одну запись файла к виду {name, url, login, password}.
+    URL нормализуется (_normalize_url). Запись без URL невалидна.
+    """
     from core.auth import _normalize_url
 
-    merged: list[dict] = []
+    if not isinstance(record, dict):
+        return {"name": "", "url": "", "login": "",
+                "password": "", "valid": False}
+    url = _normalize_url(_clean_str(record.get("url"), "url"))
+    name = _clean_str(record.get("name"), "name")
+    if not url:
+        return {
+            "name": name or "(без URL)",
+            "url": "",
+            "login": _clean_str(record.get("login"), "login"),
+            "password": str(record.get("password") or ""),
+            "valid": False,
+        }
+    if not name:
+        name = "База " + url.split("/")[-1]
+    return {
+        "name": name,
+        "url": url,
+        "login": _clean_str(record.get("login"), "login"),
+        "password": str(record.get("password") or "").strip(),
+        "valid": True,
+    }
+
+
+def load_client_databases(data) -> list[dict]:
+    """
+    Разбирает содержимое файла клиентских баз в нормализованные записи
+    {name, url, login, password}. ``data`` — байты или строка файла.
+    Поддерживается JSON (список объектов либо объект с одним списком
+    записей) и CSV с заголовками на русском или английском.
+    Записи без URL отбрасываются (помечаются valid=False).
+    """
+    if isinstance(data, (bytes, bytearray)):
+        text = bytes(data).decode("utf-8-sig")
+    else:
+        text = str(data)
+    text = text.lstrip("\ufeff").strip()
+    if not text:
+        return []
+
+    records: list
+    if text.lstrip().startswith(("[", "{")):
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Некорректный JSON: {e}") from e
+        if isinstance(raw, dict):
+            for key in ("databases", "bases", "clients", "items", "rows"):
+                if isinstance(raw.get(key), list):
+                    raw = raw[key]
+                    break
+            else:
+                raw = [raw]
+        if not isinstance(raw, list):
+            raise ValueError("Ожидался список баз (массив JSON)")
+        records = raw
+    else:
+        import csv
+        import io as _io
+        reader = csv.DictReader(_io.StringIO(text))
+        field_map: dict[str, str] = {}
+        for header in (reader.fieldnames or []):
+            field = _map_import_field(header)
+            if field and field not in field_map.values():
+                field_map[header] = field
+        if not field_map:
+            raise ValueError(
+                "Не найдено ни одного нужного столбца. Ожидаются "
+                "название/name, ссылка/url, логин/login, пароль/password."
+            )
+        records = [
+            {field: row.get(header) for header, field in field_map.items()}
+            for row in reader
+        ]
+
+    out = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        mapped: dict = {}
+        for field, aliases in _IMPORT_FIELD_ALIASES.items():
+            for alias in aliases:
+                key = _normalize_row_key(alias)
+                match = next(
+                    (k for k in record if _normalize_row_key(k) == key), None
+                )
+                if match is not None:
+                    mapped[field] = record[match]
+                    break
+        out.append(_normalize_import_row(mapped))
+    return out
+
+
+def import_bases(entries: list[dict], active: bool = True) -> dict:
+    """
+    Импортирует записи файла клиентских баз в таблицу bases.
+    Существующие базы (по нормализованному URL) НЕ обновляются и НЕ
+    дублируются — они попадают в skipped. Записи без URL — в invalid.
+    Возвращает отчёт: {added, skipped, invalid, added_rows, errors}.
+    """
+    report: dict = {
+        "added": 0,
+        "skipped": 0,
+        "invalid": 0,
+        "added_rows": [],
+        "errors": [],
+    }
     seen: set[str] = set()
-    for entry in db_bases or []:
-        url = _normalize_url(entry.get("url") or "")
-        if not url or url in seen:
+    for raw in entries or []:
+        entry = _normalize_import_row(raw)
+        if not entry["valid"]:
+            report["invalid"] += 1
+            report["errors"].append(f"{entry['name'] or '?'}: не указан URL")
             continue
-        seen.add(url)
-        merged.append({
-            "name": str(entry.get("name") or "").strip(),
-            "url": url,
-            "login": str(entry.get("login") or "").strip(),
-            "password": str(entry.get("password") or ""),
-        })
-    for entry in file_entries or []:
-        url = _normalize_url(entry.get("url") or "")
+        url = entry["url"]
         if url in seen:
+            report["skipped"] += 1
             continue
         seen.add(url)
-        merged.append({
-            "name": str(entry.get("name") or "").strip(),
-            "url": url,
-            "login": str(entry.get("login") or "").strip(),
-            "password": str(entry.get("password") or ""),
-        })
-    return merged
+        if get_base(url) is not None:
+            report["skipped"] += 1
+            continue
+        if _secret_key_is_broken():
+            report["errors"].append(
+                f"{_SECRET_KEY_ENV} задан, но неверен — импорт остановлен, "
+                "чтобы не сохранить пароли в открытом виде. Исправьте ключ."
+            )
+            break
+        created = insert_base(
+            name=entry["name"],
+            url=url,
+            login=entry["login"],
+            password=entry["password"],
+            sno=None,
+            group=None,
+            active_doc_types=None,
+            active=active,
+        )
+        if created is None:
+            report["skipped"] += 1
+        else:
+            report["added"] += 1
+            report["added_rows"].append(created)
+    return report
 
 
 # =============================== НОРМЫ =====================================

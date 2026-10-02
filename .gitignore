@@ -1,6 +1,9 @@
 # Секреты и локальные конфиги
 users.json
 user.json
+# Список клиентских баз 1С содержит логины и пароли OData — в репозиторий
+# не попадает. Шаблон структуры: client_databases.example.json
+client_databases.json
 .env
 .env.*
 !.env.example
@@ -34,6 +37,8 @@ htmlcov/
 .vscode/
 .DS_Store
 Thumbs.db
+# Служебные файлы Word (~$имя.docx) появляются при открытии документа
+~$*
 
 # Streamlit
 .streamlit/

@@ -391,9 +391,30 @@ def _visible_databases(entries: list) -> list:
     ]
 
 
+def _list_bases_or_error(active_only: bool, where=None) -> list[dict]:
+    """
+    db.list_bases с понятным сообщением вместо трассировки, если ключ
+    шифрования задан, но неверен: приложение не может показать пароли,
+    которые лежат в БД зашифрованными.
+    """
+
+    try:
+        return db.list_bases(active_only=active_only)
+    except db.SecretKeyError as e:
+        st.error(
+            f"Не удалось прочитать пароли клиентских баз: {e}\n\n"
+            "Пока ключ шифрования неверен, приложение не покажет базы и не "
+            "подключится к 1С — намеренно, чтобы не подставить пустой пароль.",
+            icon="🔐",
+        )
+        if where is not None:
+            where.caption("Исправьте ключ и обновите страницу.")
+        return []
+
+
 def select_base() -> dict:
     st.sidebar.header("База 1С:Фреш")
-    all_bases = db.list_bases(active_only=True)
+    all_bases = _list_bases_or_error(active_only=True, where=st.sidebar)
     bases = _visible_databases(all_bases)
     if all_bases and not bases:
         st.sidebar.info("Нет баз, доступных вашей учётной записи.")
@@ -1009,7 +1030,7 @@ def render_employees_tab():
 def render_bases_tab():
     st.title("Базы клиентов")
     can_edit = _permission_flag("can_edit_bases")
-    all_bases = db.list_bases(active_only=False)
+    all_bases = _list_bases_or_error(active_only=False)
     bases = _visible_databases(all_bases)
     if not bases:
         st.info(
@@ -1034,6 +1055,70 @@ def render_bases_tab():
     def dt_label(k: str) -> str:
         spec = doc_types[k]
         return f"{spec.get('title', k)} · {spec.get('category', '')}"
+
+    st.markdown("---")
+    st.subheader("Массовый импорт из файла")
+    st.caption(
+        "Загрузите выгрузку 1С: JSON или CSV со столбцами "
+        "«название, ссылка, логин, пароль» (или name, url, login, password). "
+        "Существующие базы не перезаписываются, записи без ссылки "
+        "пропускаются. Пароли сохраняются зашифрованными, если задан "
+        "ключ AUDIT_DB_SECRET_KEY."
+    )
+    uploaded = st.file_uploader(
+        "Файл с клиентскими базами", type=["json", "csv"],
+        key="import_bases_file",
+        help="Файл не сохраняется на сервере приложения и читается только "
+             "в момент импорта.",
+    )
+    if uploaded is not None:
+        try:
+            parsed = db.load_client_databases(uploaded.getvalue())
+        except ValueError as e:
+            st.error(f"Не удалось разобрать файл: {e}")
+        else:
+            ready = [r for r in parsed if r["valid"]]
+            broken = [r for r in parsed if not r["valid"]]
+            already = [r for r in ready if db.get_base(r["url"]) is not None]
+            fresh = [r for r in ready if db.get_base(r["url"]) is None]
+            st.write(
+                f"**Готово к импорту: {len(fresh)}**. "
+                f"Уже в базе: {len(already)}. Без ссылки (пропуск): {len(broken)}."
+            )
+            if broken:
+                st.warning(
+                    "Без ссылки и будут пропущены: "
+                    + ", ".join(r["name"] or "?" for r in broken[:10])
+                )
+            preview = fresh[:50]
+            if preview:
+                with st.expander(
+                    f"Предпросмотр первых {len(preview)} из {len(fresh)}"
+                ):
+                    st.dataframe(
+                        pd.DataFrame(preview)[["name", "url", "login"]],
+                        use_container_width=True,
+                    )
+            if db._secret_key_is_broken():
+                st.error(
+                    "Ключ AUDIT_DB_SECRET_KEY задан, но неверен. Импорт "
+                    "невозможен: приложение не станет сохранять пароли "
+                    "в открытом виде. Исправьте ключ и обновите страницу."
+                )
+            elif fresh and st.button(
+                f"Импортировать {len(fresh)} баз", type="primary",
+                key="import_bases_run",
+            ):
+                report = db.import_bases(parsed)
+                if report["errors"]:
+                    for err in report["errors"][:5]:
+                        st.error(err)
+                st.success(
+                    f"Импортировано: {report['added']}, "
+                    f"пропущено (уже есть/дубль): {report['skipped']}, "
+                    f"без ссылки: {report['invalid']}."
+                )
+                st.rerun()
 
     st.markdown("---")
     st.subheader("Новая база")
@@ -1066,7 +1151,7 @@ def render_bases_tab():
 
     st.markdown("---")
     st.subheader("Обновление базы")
-    bases = db.list_bases(active_only=False)
+    bases = _list_bases_or_error(active_only=False)
     if bases:
         pick = st.selectbox(
             "База", [(b["name"], b["id"]) for b in bases],

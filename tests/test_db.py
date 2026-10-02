@@ -634,8 +634,14 @@ def test_base_password_legacy_plaintext_still_readable(clean_db, monkeypatch):
     db._SECRET_CACHE.clear()
 
 
-def test_base_password_token_unreadable_without_key(clean_db, monkeypatch):
-    """Потерянный ключ не приводит к падению — пароль пустой, токен цел."""
+def test_base_password_token_unreadable_with_other_key(clean_db, monkeypatch):
+    """
+    Пароль зашифрован другим ключом -> SecretKeyError с понятным текстом.
+
+    Раньше здесь возвращалась пустая строка, и подключение к 1С уходило с
+    пустым паролем: ошибка выглядела как «пароль потерялся», хотя ключ просто
+    не тот. Теперь тишины нет, а токен в БД остаётся нетронутым.
+    """
     pytest.importorskip("cryptography")
     from cryptography.fernet import Fernet
 
@@ -647,10 +653,21 @@ def test_base_password_token_unreadable_without_key(clean_db, monkeypatch):
 
     monkeypatch.setenv(db._SECRET_KEY_ENV, Fernet.generate_key().decode())
     db._SECRET_CACHE.clear()
-    assert db.get_base_by_id(base["id"])["password"] == ""
+    with pytest.raises(db.SecretKeyError):
+        db.get_base_by_id(base["id"])
     # Токен не перетирается при обновлении других полей
     db.update_base(base["id"], sno="ОСН")
     assert _raw_password(base["id"]) == token
+    db._SECRET_CACHE.clear()
+
+
+def test_base_password_untouched_when_no_key(clean_db, monkeypatch):
+    """Без ключа legacy-пароль в открытом виде читается как есть."""
+    monkeypatch.delenv(db._SECRET_KEY_ENV, raising=False)
+    db._SECRET_CACHE.clear()
+    base = db.insert_base("А", "https://plain.example/a", "u", "legacy-pass")
+    assert _raw_password(base["id"]) == "legacy-pass"
+    assert db.get_base_by_id(base["id"])["password"] == "legacy-pass"
     db._SECRET_CACHE.clear()
 
 
@@ -664,3 +681,170 @@ def test_generate_secret_key_is_usable(clean_db, monkeypatch):
     base = db.insert_base("А", "https://x.example/a", "u", "pw")
     assert db.get_base_by_id(base["id"])["password"] == "pw"
     db._SECRET_CACHE.clear()
+
+
+def test_broken_secret_key_raises_instead_of_silent_plaintext(
+    clean_db, monkeypatch
+):
+    """
+    Ключ задан, но неверен -> SecretKeyError, а не тихое отключение
+    шифрования (иначе пароли сохранились бы в открытом виде).
+    """
+
+    monkeypatch.setenv(db._SECRET_KEY_ENV, "не-fernet-ключ")
+    db._SECRET_CACHE.clear()
+    assert db._secret_key_is_broken() is True
+    with pytest.raises(db.SecretKeyError):
+        db._get_fernet()
+    with pytest.raises(db.SecretKeyError):
+        db.insert_base("А", "https://broken.example/a", "u", "pw")
+    # ничего не записано: подмена пароля пустым недопустима
+    assert db.get_base("https://broken.example/a") is None
+    db._SECRET_CACHE.clear()
+
+
+def test_broken_secret_key_stops_import(clean_db, monkeypatch):
+    """
+    Импорт не должен частично записать базы с открытыми паролями,
+    если ключ задан, но неверен.
+    """
+
+    monkeypatch.setenv(db._SECRET_KEY_ENV, "битый")
+    db._SECRET_CACHE.clear()
+    report = db.import_bases([
+        {"name": "А", "url": "https://a.example/a", "login": "u", "password": "p"},
+    ])
+    assert report["added"] == 0
+    assert report["errors"]
+    assert db.get_base("https://a.example/a") is None
+    db._SECRET_CACHE.clear()
+
+
+def test_import_bases_dedup_and_report(clean_db):
+    """
+    Дубли по URL и внутри файла, и с уже существующей базой: без дублей
+    в БД, всё попадает в отчёт. Запись без URL -> invalid.
+    """
+
+    db.insert_base("СТЕПП", "https://msk1.1cfresh.com/a/ea/3504241", "l", "p")
+    entries = [
+        {"name": "1;А", "url": "https://msk1.1cfresh.com/a/ea/1000001",
+         "login": "u", "password": "p1"},
+        {"name": "1;А (дубль в файле)",
+         "url": "https://msk1.1cfresh.com/a/ea/1000001",
+         "login": "u", "password": "p1"},
+        {"name": "2;Б", "url": " https://msk1.1cfresh.com/a/ea/1000002/ ",
+         "login": "u", "password": "p2"},
+        {"name": "СТЕПП (уже есть)",
+         "url": "https://msk1.1cfresh.com/a/ea/3504241",
+         "login": "other", "password": "other"},
+        {"name": "123", "url": "", "login": "", "password": ""},
+    ]
+    report = db.import_bases(entries)
+    assert report["added"] == 2
+    assert report["invalid"] == 1
+    assert report["skipped"] == 2
+    assert db.get_base("https://msk1.1cfresh.com/a/ea/1000001")["name"] == "1;А"
+    # префиксы имён из файла сохраняются как есть
+    assert db.get_base("https://msk1.1cfresh.com/a/ea/1000002")["name"] == "2;Б"
+    # существующая база не перезаписана
+    assert db.get_base("https://msk1.1cfresh.com/a/ea/3504241")["login"] == "l"
+
+
+def test_import_bases_is_idempotent(clean_db):
+    entries = [
+        {"name": "1;А", "url": "https://msk1.1cfresh.com/a/ea/2000001",
+         "login": "u", "password": "p1"},
+    ]
+    first = db.import_bases(entries)
+    count_after_first = len(db.list_bases())
+    second = db.import_bases(entries)
+    assert first["added"] == 1
+    assert second["added"] == 0
+    assert second["skipped"] == 1
+    assert len(db.list_bases()) == count_after_first
+
+
+def test_import_encrypts_passwords_with_key(clean_db, monkeypatch):
+    """С ключом пароль в БД лежит зашифрованным, наружу отдаётся открытым."""
+
+    pytest.importorskip("cryptography")
+    monkeypatch.setenv(db._SECRET_KEY_ENV, db.generate_secret_key())
+    db._SECRET_CACHE.clear()
+    base = db.insert_base("А", "https://enc.example/a", "u", "secret-pw")
+
+    raw = db.get_base_by_id(base["id"])["password"]
+    assert raw == "secret-pw"  # list_bases/get_base расшифровывают
+
+    conn = sqlite3.connect(db._DB_PATH)
+    stored = conn.execute(
+        "SELECT password FROM bases WHERE id = ?", (base["id"],)
+    ).fetchone()[0]
+    conn.close()
+    assert stored.startswith(db._ENC_PREFIX)
+    assert "secret-pw" not in stored
+    db._SECRET_CACHE.clear()
+
+
+def test_load_client_databases_json_csv_and_bom(clean_db):
+    """Формат: JSON-массив, JSON с обёрткой, CSV с русскими заголовками, BOM."""
+
+    payload = [
+        {"name": "1;А", "url": "https://msk1.1cfresh.com/a/ea/1000001",
+         "login": "u", "password": "p1"},
+        {"name": "no-url", "url": "", "login": "", "password": ""},
+    ]
+    text = json.dumps(payload, ensure_ascii=False)
+
+    rows = db.load_client_databases(text)
+    assert len(rows) == 2
+    assert rows[0]["valid"] is True and rows[1]["valid"] is False
+
+    # BOM (файл из Windows) не должен ломать разбор
+    assert db.load_client_databases("﻿" + text)[0]["url"] == (
+        "https://msk1.1cfresh.com/a/ea/1000001"
+    )
+    # и в виде байтов
+    assert len(db.load_client_databases(("﻿" + text).encode("utf-8"))) == 2
+
+    # обёртка {"databases": [...]}
+    wrapped = json.dumps({"databases": payload}, ensure_ascii=False)
+    assert len(db.load_client_databases(wrapped)) == 2
+
+    # CSV с русскими заголовками
+    csv_text = ("название,ссылка,логин,пароль\n"
+                "1;А,https://msk1.1cfresh.com/a/ea/1000001,u,p1\n")
+    csv_rows = db.load_client_databases(csv_text)
+    assert len(csv_rows) == 1
+    assert csv_rows[0]["name"] == "1;А"
+    assert csv_rows[0]["url"] == "https://msk1.1cfresh.com/a/ea/1000001"
+    assert csv_rows[0]["password"] == "p1"
+
+    # неизвестный формат/пустой файл
+    assert db.load_client_databases("") == []
+    with pytest.raises(ValueError):
+        db.load_client_databases("[{не json}]")
+    with pytest.raises(ValueError):
+        db.load_client_databases("колонка1,колонка2\n1,2\n")
+
+
+def test_upsert_employee_idempotent_does_not_create_users(clean_db):
+    """
+    9 фамилий из docs/Список сотрудников.docx: повторный импорт не
+    плодит дубли и не заводит учётные записи — users создаются отдельно.
+    """
+
+    surnames = ["Шмаракова", "Османова", "Зверева", "Сагирова", "Кузьменко",
+                "Реутова", "Архипова", "Радаева", "Яблонцева"]
+    for name in surnames:
+        db.upsert_employee(full_name=name, role="бухгалтер")
+    assert len(db.list_employees()) == len(surnames)
+
+    for name in surnames:  # второй проход
+        db.upsert_employee(full_name=name, role="бухгалтер")
+    assert len(db.list_employees()) == len(surnames)
+    assert {e["full_name"] for e in db.list_employees()} == set(surnames)
+
+    # сотрудники не равны учётным записям
+    linked = [u for u in db.list_users() if u.get("employee_full_name")]
+    assert linked == []
