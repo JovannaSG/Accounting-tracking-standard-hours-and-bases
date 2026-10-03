@@ -1,0 +1,28 @@
+# Файлы проекта хранятся только в UTF-8.
+#
+# Причина: в коммите 7b10e78 руководство администратора было сохранено не в
+# UTF-8 (типичная ситуация для Windows/cp1251) и прочитано с потерей символов —
+# все 17353 кириллических символа превратились в U+FFFD. Отделить
+# неиспользуемый столбец БД помогла только история Git.
+#
+# charset = utf-8 заставляет редактор и git-клиент не допускать повторения.
+# Регрессия закрыта тестом tests/test_docs.py::test_docs_are_valid_utf8_without_replacement_chars
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{json,yml,yaml}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+
+[*.py]
+max_line_length = 88

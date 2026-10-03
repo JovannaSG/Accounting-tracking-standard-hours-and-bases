@@ -169,7 +169,6 @@ def init_db():
     Дополнительные поля:
       - sno   — система налогообложения клиента (заполняется вручную,
                 т.к. регистр СНО в OData-составе обычно не публикуется);
-      - group — группа клиентов для отборов по группе;
       - active_doc_types — JSON-список ключей видов документов, которые
                 выгружаются по этой базе; NULL или пустой список означает
                 «выгружать все виды из реестра doc_types.json».
@@ -215,7 +214,6 @@ def init_db():
             login TEXT,
             password TEXT,
             sno TEXT,
-            "group" TEXT,
             active_doc_types TEXT,
             created_at TEXT,
             active INTEGER NOT NULL DEFAULT 1
@@ -225,10 +223,19 @@ def init_db():
     existing = {row[1] for row in cursor.fetchall()}
     if "sno" not in existing:
         cursor.execute("ALTER TABLE bases ADD COLUMN sno TEXT")
-    if "group" not in existing:
-        cursor.execute('ALTER TABLE bases ADD COLUMN "group" TEXT')
     if "active_doc_types" not in existing:
         cursor.execute("ALTER TABLE bases ADD COLUMN active_doc_types TEXT")
+    if "group" in existing:
+        # Колонка была неиспользуемой: значение сохранялось, но нигде не
+        # участвовало в расчётах и не попадало в отчёт. Убрана как
+        # мёртвая функциональность (YAGNI) — вернуть при появлении
+        # группировки по группам клиентов можно из истории Git.
+        # DROP COLUMN появился в SQLite 3.35.0; на более старой версии
+        # колонка просто остаётся неиспользуемой.
+        try:
+            cursor.execute('ALTER TABLE bases DROP COLUMN "group"')
+        except sqlite3.OperationalError:
+            pass
 
     # Регистр норм трудозатрат (ТЗ §4.1)
     cursor.execute("""
@@ -512,7 +519,7 @@ def delete_user(login: str) -> bool:
 
 # =============================== БАЗЫ КЛИЕНТОВ ==============================
 _BASES_SELECT = (
-    "id, name, url, login, password, sno, \"group\", active_doc_types, "
+    "id, name, url, login, password, sno, active_doc_types, "
     "created_at, active"
 )
 
@@ -531,10 +538,9 @@ def _base_row(row) -> dict:
         "login": row[3],
         "password": _decrypt_password(row[4]),
         "sno": row[5],
-        "group": row[6],
-        "active_doc_types": _parse_json_list(row[7]),
-        "created_at": row[8],
-        "active": bool(row[9]),
+        "active_doc_types": _parse_json_list(row[6]),
+        "created_at": row[7],
+        "active": bool(row[8]),
     }
 
 
@@ -582,7 +588,6 @@ def insert_base(
     login: str,
     password: str,
     sno: str | None = None,
-    group: str | None = None,
     active_doc_types: list[str] | None = None,
     active: bool = True,
 ) -> dict | None:
@@ -602,16 +607,15 @@ def insert_base(
     conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO bases (name, url, login, password, sno, \"group\", "
+        "INSERT INTO bases (name, url, login, password, sno, "
         "active_doc_types, created_at, active) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             str(name or "").strip(),
             norm,
             str(login or "").strip(),
             _encrypt_password(password),
             (str(sno).strip() if sno else None),
-            (str(group).strip() if group else None),
             _dump_doc_types(active_doc_types),
             datetime.now().isoformat(timespec="seconds"),
             int(bool(active)),
@@ -630,7 +634,6 @@ def update_base(
     login: str | None = None,
     password: str | None = None,
     sno: str | None = None,
-    group: str | None = None,
     active_doc_types: list[str] | None = None,
     active: bool | None = None,
 ) -> bool:
@@ -669,7 +672,6 @@ def update_base(
     else:
         new_pass_enc = _encrypt_password(base["password"] or "")
     new_sno = base["sno"] if sno is None else (str(sno).strip() if sno else None)
-    new_group = base["group"] if group is None else (str(group).strip() if group else None)
     new_types = (
         _dump_doc_types(base["active_doc_types"])
         if active_doc_types is None
@@ -682,8 +684,8 @@ def update_base(
     cursor = conn.cursor()
     cursor.execute(
         "UPDATE bases SET name=?, url=?, login=?, password=?, sno=?, "
-        "\"group\"=?, active_doc_types=?, active=? WHERE id=?",
-        (new_name, new_url, new_login, new_pass_enc, new_sno, new_group,
+        "active_doc_types=?, active=? WHERE id=?",
+        (new_name, new_url, new_login, new_pass_enc, new_sno,
          new_types, int(new_active), base_id),
     )
     updated = cursor.rowcount > 0
@@ -723,10 +725,9 @@ def _raw_base_by_id(base_id: int):
         "login": row[3],
         "password": row[4],  # токен как есть, без расшифровки
         "sno": row[5],
-        "group": row[6],
-        "active_doc_types": _parse_json_list(row[7]),
-        "created_at": row[8],
-        "active": bool(row[9]),
+        "active_doc_types": _parse_json_list(row[6]),
+        "created_at": row[7],
+        "active": bool(row[8]),
     }
 
 
@@ -955,7 +956,6 @@ def import_bases(entries: list[dict], active: bool = True) -> dict:
             login=entry["login"],
             password=entry["password"],
             sno=None,
-            group=None,
             active_doc_types=None,
             active=active,
         )

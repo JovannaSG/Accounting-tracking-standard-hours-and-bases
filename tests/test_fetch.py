@@ -1,4 +1,4 @@
-﻿import pandas as pd
+import pandas as pd
 
 from core.fetch import fetch_documents
 

@@ -180,6 +180,73 @@ def clean_db():
     db.init_db()
 
 
+# ============ УДАЛЕНИЕ НЕИСПОЛЬЗУЕМОЙ КОЛОНКИ "group" У БАЗ ================
+
+def _bases_columns() -> list[str]:
+    conn = sqlite3.connect(db._DB_PATH)
+    try:
+        return [r[1] for r in conn.execute("PRAGMA table_info(bases)")]
+    finally:
+        conn.close()
+
+
+def test_bases_has_no_group_column(clean_db):
+    """Мёртвое поле «Группа клиентов» убрано из схемы (YAGNI)."""
+    assert "group" not in _bases_columns()
+    base = db.insert_base("Клиент", "https://msk1.1cfresh.com/a/ea/1", "u", "p")
+    assert "group" not in base
+
+
+def test_init_db_migrates_legacy_bases_dropping_group(clean_db):
+    """Старая БД с колонкой group мигрируется: колонка уходит, данные целы."""
+    base = db.insert_base(
+        "Старый клиент", "https://msk1.1cfresh.com/a/ea/8", "u", "p",
+        sno="УСН",
+    )
+    conn = sqlite3.connect(db._DB_PATH)
+    conn.execute('ALTER TABLE bases ADD COLUMN "group" TEXT')
+    conn.execute(
+        'UPDATE bases SET "group"=? WHERE id=?', ("Группа А", base["id"])
+    )
+    conn.commit()
+    conn.close()
+    assert "group" in _bases_columns()
+
+    db.init_db()
+
+    if db.sqlite3.sqlite_version_info >= (3, 35, 0):
+        assert "group" not in _bases_columns()
+    # На старой SQLite колонка может остаться — это не ломает работу,
+    # но код её больше не читает и не пишет.
+    got = db.get_base_by_id(base["id"])
+    assert got["name"] == "Старый клиент"
+    assert got["sno"] == "УСН"
+    assert "group" not in got
+
+
+def test_legacy_group_data_dropped_is_not_silently_reused(clean_db):
+    """После миграции прежнее значение группы не всплывает нигде."""
+    base = db.insert_base(
+        "Клиент", "https://msk1.1cfresh.com/a/ea/9", "u", "p", sno="ОСНО"
+    )
+    conn = sqlite3.connect(db._DB_PATH)
+    conn.execute('ALTER TABLE bases ADD COLUMN "group" TEXT')
+    conn.execute(
+        'UPDATE bases SET "group"=? WHERE id=?', ("Группа Б", base["id"])
+    )
+    conn.commit()
+    conn.close()
+
+    db.init_db()
+    db.update_base(base["id"], name="Клиент переименован")
+
+    got = db.get_base_by_id(base["id"])
+    assert got["name"] == "Клиент переименован"
+    assert got["sno"] == "ОСНО"
+    assert "group" not in got
+    assert db.list_bases()[0]["sno"] == "ОСНО"
+
+
 def test_norm_roundtrip(clean_db):
     norm = db.upsert_norm(
         doc_type="bank_incoming",
@@ -312,11 +379,9 @@ def test_base_insert_with_sno(clean_db):
         login="odata.user",
         password="secret",
         sno="УСН Доходы",
-        group="Группа А",
     )
     assert base is not None
     assert base["sno"] == "УСН Доходы"
-    assert base["group"] == "Группа А"
 
     # Дубликат URL отклоняется
     dup = db.insert_base("Дубль", "https://msk1.1cfresh.com/a/ea/1119958",

@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import time
 
@@ -419,7 +419,7 @@ def select_base() -> dict:
     if all_bases and not bases:
         st.sidebar.info("Нет баз, доступных вашей учётной записи.")
         return {"id": None, "name": "", "url": "", "login": "",
-                "password": "", "sno": "", "group": ""}
+                "password": "", "sno": ""}
     options = {b["name"]: b for b in bases}
     names = list(options.keys())
     if names:
@@ -439,7 +439,7 @@ def select_base() -> dict:
     user = st.sidebar.text_input("Логин OData", value="odata.user")
     pwd = st.sidebar.text_input("Пароль OData", type="password")
     return {"id": None, "name": url, "url": url, "login": user,
-            "password": pwd, "sno": "", "group": ""}
+            "password": pwd, "sno": ""}
 
 
 def period_bounds_for_month(month: str, year: int) -> tuple[str, str, str]:
@@ -1039,8 +1039,7 @@ def render_bases_tab():
         )
     else:
         st.dataframe(pd.DataFrame(bases)[
-            ["id", "name", "url", "sno", "group", "active_doc_types",
-             "active"]])
+            ["id", "name", "url", "sno", "active_doc_types", "active"]])
 
     if not can_edit:
         st.caption(
@@ -1128,7 +1127,6 @@ def render_bases_tab():
         login = st.text_input("Логин OData")
         password = st.text_input("Пароль OData", type="password")
         sno = st.text_input("Система налогообложения (вручную)")
-        group = st.text_input("Группа клиентов (опц.)")
         new_types = st.multiselect(
             "Виды документов этой базы (пусто = все)", dt_keys,
             format_func=dt_label, key="add_base_types",
@@ -1141,7 +1139,7 @@ def render_bases_tab():
             else:
                 base = db.insert_base(
                     name, url, login, password, sno=sno or None,
-                    group=group or None, active_doc_types=new_types,
+                    active_doc_types=new_types,
                 )
                 if base is None:
                     st.warning("Такая база уже есть.")
@@ -1162,7 +1160,6 @@ def render_bases_tab():
             name2 = st.text_input("Название", value=b["name"])
             url2 = st.text_input("URL", value=b["url"])
             sno2 = st.text_input("СНО", value=b["sno"] or "")
-            group2 = st.text_input("Группа", value=b["group"] or "")
             types2 = st.multiselect(
                 "Виды документов этой базы (пусто = все)", dt_keys,
                 default=[k for k in b["active_doc_types"] if k in dt_keys],
@@ -1177,8 +1174,7 @@ def render_bases_tab():
             if submitted2:
                 db.update_base(
                     b["id"], name=name2, url=url2, sno=sno2,
-                    group=group2, active_doc_types=types2,
-                    password=password2 or None
+                    active_doc_types=types2, password=password2 or None,
                 )
                 st.success("Обновлено")
                 st.rerun()
