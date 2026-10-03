@@ -35,11 +35,20 @@ def _resolve_key(
     """
     Определяет ключ нормы для документа.
 
-    Для сущностей с вариантами (авансовый отчёт «до 10 чеков» vs
-    «с ГСМ или командировкой») выбирается вариант по вхождению термов
-    в ``variant_field`` записи (по умолчанию ВидОперации), case-insensitive.
-    Базовая запись с ``variants`` — селектор: совпавший терм уводит на
-    ``variant_to``, иначе остаёмся на базовом ключе (default).
+    Для сущностей с вариантами выбор осуществляется по вхождению термов
+    в поле записи (по умолчанию ``ВидОперации``), регистронезависимо.
+
+    Поддерживаются два формата правил вариантов (обратная совместимость):
+    - Устаревший (single-rule): ``variants: [str,...]`` + ``variant_to: str``
+      + опционально ``variant_field: str``. При совпадении любого терма
+      документ маршрутизируется на ``variant_to``.
+    - Новый (multi-rule): ``variant_rules: [{"terms":[str,...], "to": str,
+      "field": str?}, ...]``. Правила проверяются по порядку; первое
+      совпадение определяет целевой ключ. Если ни одно правило не сработало,
+      документ остаётся на текущем ключе (базовом).
+
+    Если у записи есть и ``variant_rules``, и старый формат — приоритет
+    отдаётся ``variant_rules``.
     """
 
     if len(entries) == 1:
@@ -47,15 +56,31 @@ def _resolve_key(
 
     by_key = dict(entries)
     for key, spec in entries:
-        if not spec.get("variants"):
-            continue
-        value = _variant_value(rec, spec).lower()
-        for term in spec["variants"]:
-            if term.lower() in value:
-                target = spec.get("variant_to")
-                if target and target in by_key:
-                    return target, by_key[target]
-        return key, spec
+        rules = spec.get("variant_rules")
+        if rules:
+            for rule in rules:
+                terms = rule.get("terms") or []
+                if not terms:
+                    continue
+                field = rule.get("field") or spec.get("variant_field") or "ВидОперации"
+                value = str(rec.get(field) or "").lower()
+                for term in terms:
+                    t = str(term).lower()
+                    if t and t in value:
+                        target = rule.get("to")
+                        if target and target in by_key:
+                            return target, by_key[target]
+            # ни одно правило не совпало — остаёмся на базовом ключе
+            return key, spec
+
+        if spec.get("variants"):
+            value = _variant_value(rec, spec).lower()
+            for term in spec["variants"]:
+                if str(term).lower() in value:
+                    target = spec.get("variant_to")
+                    if target and target in by_key:
+                        return target, by_key[target]
+            return key, spec
     return entries[0]
 
 

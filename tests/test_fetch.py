@@ -1,4 +1,4 @@
-import pandas as pd
+﻿import pandas as pd
 
 from core.fetch import fetch_documents
 
@@ -155,3 +155,65 @@ def test_tmc_documents_have_own_entities():
     )
     assert spec["return_customer"]["entity"] == "Document_ВозвратТоваровОтПокупателя"
     assert spec["return_customer"]["title"] == "Возврат товаров от покупателя"
+
+def test_resolve_key_multi_rule_first_match():
+    from core.fetch import _resolve_key
+
+    entries = [
+        ("base", {"entity": "E"}),
+        ("tax", {"entity": "E"}),
+        ("salary", {"entity": "E"}),
+    ]
+    spec_base = {
+        "entity": "E",
+        "variant_rules": [
+            {"terms": ["налог"], "to": "tax"},
+            {"terms": ["заработн", "зарплат"], "to": "salary"},
+        ],
+    }
+    entries_with_rules = [
+        ("base", spec_base),
+        ("tax", {"entity": "E"}),
+        ("salary", {"entity": "E"}),
+    ]
+    k, _ = _resolve_key(entries_with_rules, {"ВидОперации": "ПеречислениеНалога"})
+    assert k == "tax"
+    k, _ = _resolve_key(entries_with_rules, {"ВидОперации": "Выплата заработной платы"})
+    assert k == "salary"
+
+
+def test_resolve_key_multi_rule_fallback():
+    from core.fetch import _resolve_key
+
+    spec_base = {
+        "entity": "E",
+        "variant_rules": [
+            {"terms": ["налог"], "to": "tax"},
+        ],
+    }
+    entries = [
+        ("base", spec_base),
+        ("tax", {"entity": "E"}),
+    ]
+    k, _ = _resolve_key(entries, {"ВидОперации": "ОплатаПоставщику"})
+    assert k == "base"
+
+
+def test_resolve_key_multi_rule_with_field_override():
+    from core.fetch import _resolve_key
+
+    spec_base = {
+        "entity": "E",
+        "variant_field": "КодВидаОперации",
+        "variant_rules": [
+            {"terms": ["02", "18"], "to": "corr"},
+        ],
+    }
+    entries = [
+        ("base", spec_base),
+        ("corr", {"entity": "E"}),
+    ]
+    k, _ = _resolve_key(entries, {"КодВидаОперации": "02"})
+    assert k == "corr"
+    k, _ = _resolve_key(entries, {"КодВидаОперации": "01"})
+    assert k == "base"
