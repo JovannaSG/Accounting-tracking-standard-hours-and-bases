@@ -258,6 +258,20 @@ def init_db():
             UNIQUE (doc_type)
         )
     """)
+    cursor.execute("PRAGMA table_info(norms)")
+    existing_norms = {row[1] for row in cursor.fetchall()}
+    if "is_discovered" not in existing_norms:
+        cursor.execute("ALTER TABLE norms ADD COLUMN is_discovered INTEGER NOT NULL DEFAULT 0")
+    if "discovered_at" not in existing_norms:
+        cursor.execute("ALTER TABLE norms ADD COLUMN discovered_at TEXT")
+    if "has_responsible_key" not in existing_norms:
+        cursor.execute("ALTER TABLE norms ADD COLUMN has_responsible_key INTEGER NOT NULL DEFAULT 0")
+    if "has_author_key" not in existing_norms:
+        cursor.execute("ALTER TABLE norms ADD COLUMN has_author_key INTEGER NOT NULL DEFAULT 0")
+    if "has_operation_type" not in existing_norms:
+        cursor.execute("ALTER TABLE norms ADD COLUMN has_operation_type INTEGER NOT NULL DEFAULT 0")
+    if "variant_rules_json" not in existing_norms:
+        cursor.execute("ALTER TABLE norms ADD COLUMN variant_rules_json TEXT")
 
     # Соответствие «Сотрудник аутсорсера -> Пользователь 1С» (ТЗ §3.3)
     cursor.execute("""

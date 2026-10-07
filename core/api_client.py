@@ -261,12 +261,12 @@ class OneCClient:
             raise
 
     def fetch_metadata_entity_sets(self) -> dict[str, str]:
-        """
-        Возвращает {имя сущности: набор EntityType} из $metadata.
+        """Fetch and parse OData $metadata to extract entity sets.
 
-        Служит для диагностики (проверка, опубликованы ли нужные документы).
+        Returns:
+            dict: mapping of entity set name (e.g., 'Document_РеализацияТоваровУслуг')
+                  to its EntityType (e.g., 'StandardODATA.Document_РеализацияТоваровУслуг')
         """
-
         from xml.etree import ElementTree
 
         url = f"{self.base_url}/odata/standard.odata/$metadata"
@@ -276,18 +276,51 @@ class OneCClient:
         except requests.exceptions.HTTPError as e:
             raise ValueError(self._friendly_http_error(e)) from e
         except requests.exceptions.RequestException as e:
-            raise ValueError(f"Не удалось соединиться с 1C: {e}") from e
+            raise ValueError(f"Ошибка при обращении к 1C: {e}") from e
 
         root = ElementTree.fromstring(response.content)
         sets: dict[str, str] = {}
         for elem in root.iter():
             tag = elem.tag.rsplit("}", 1)[-1] if "}" in elem.tag else elem.tag
             if tag == "EntitySet":
-                name = elem.attrib.get("Name")
-                typ = elem.attrib.get("EntityType")
-                if name:
-                    sets[name] = typ or ""
+                name = elem.attrib.get("Name") or elem.attrib.get("name")
+                etype = elem.attrib.get("EntityType") or elem.attrib.get("entityType")
+                if name and etype:
+                    sets[name] = etype
         return sets
+
+    def fetch_metadata_entity_properties(self) -> dict[str, dict[str, set[str]]]:
+        """Fetch and parse OData $metadata to extract EntityType properties.
+
+        Returns:
+            dict: mapping of EntityType name to dict with 'properties' set
+        """
+        from xml.etree import ElementTree
+
+        url = f"{self.base_url}/odata/standard.odata/$metadata"
+        try:
+            response = self.session.get(url, timeout=30)
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            raise ValueError(self._friendly_http_error(e)) from e
+        except requests.exceptions.RequestException as e:
+            raise ValueError(f"Ошибка при обращении к 1C: {e}") from e
+
+        root = ElementTree.fromstring(response.content)
+        result: dict[str, dict[str, set[str]]] = {}
+        current_entity_type: str | None = None
+        for elem in root.iter():
+            tag = elem.tag.rsplit("}", 1)[-1] if "}" in elem.tag else elem.tag
+            if tag == "EntityType":
+                current_entity_type = elem.attrib.get("Name") or elem.attrib.get("name")
+                if current_entity_type:
+                    result.setdefault(current_entity_type, {"properties": set()})
+                continue
+            if tag == "Property" and current_entity_type:
+                prop_name = elem.attrib.get("Name") or elem.attrib.get("name")
+                if prop_name:
+                    result[current_entity_type]["properties"].add(prop_name)
+        return result
 
     # ============================ ДАТЫ/ПЕРИОДЫ ===============================
     @staticmethod
