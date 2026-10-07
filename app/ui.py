@@ -684,6 +684,33 @@ def render_report_tab(base: dict):
 
     st.dataframe(filtered)
 
+    # Документы без нормы / с нулевыми нормочасами (ТЗ §4.1). Считаем по
+    # уже отобранному `filtered`, ничего не пересчитывая: totals/emp_load
+    # (строки 649-650) и export_excel (строка 704) используют этот же фрейм,
+    # поэтому ниже — только копия среза, без мутаций.
+    if user_role() != auth.ROLE_ACCOUNTANT:
+        _hours_col = "Трудозатраты, нормочасы"
+        if _hours_col in filtered.columns:
+            # NaN/строки -> 0: «норма не задана» == «нормочасов нет»
+            _hours = pd.to_numeric(filtered[_hours_col], errors="coerce")
+            _zero_docs = filtered.loc[_hours.fillna(0).eq(0)]
+            if not _zero_docs.empty:
+                # Колонки, фактически присутствующие в текущей группировке
+                _show_cols = [
+                    c for c in (
+                        "Клиент", "Вид документа", "Вид операции",
+                        "Ответственный сотрудник", "Количество операций",
+                        "Норма на операцию", "Коэффициент сложности",
+                        _hours_col, "Комментарий",
+                    )
+                    if c in _zero_docs.columns
+                ]
+                with st.expander(
+                    f"Документы без нормы / нулевые нормочасы ({len(_zero_docs)})",
+                    key="zero_hours_docs",
+                ):
+                    st.dataframe(_zero_docs[_show_cols].copy())
+
     st.subheader("Загрузка сотрудников")
     if emp_load.empty:
         st.info("Нет распределённых операций.")
