@@ -913,3 +913,243 @@ def test_upsert_employee_idempotent_does_not_create_users(clean_db):
     # сотрудники не равны учётным записям
     linked = [u for u in db.list_users() if u.get("employee_full_name")]
     assert linked == []
+
+# ============ СКИМ-ДРИФТ: init_db() МОЖЕТ ТОЛЬКО ДОБАВЛЯТЬ ================
+
+def _schema_snapshot(path: str) -> dict:
+    """{таблица: {столбец: (type, notnull, default_value, pk)}}."""
+    conn = sqlite3.connect(path)
+    try:
+        tables = [
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        return {
+            table: {
+                row[1]: (row[2], row[3], row[4], row[5])
+                for row in conn.execute(f'PRAGMA table_info("{table}")')
+            }
+            for table in tables
+        }
+    finally:
+        conn.close()
+
+
+def test_init_db_is_additive_only(monkeypatch):
+    """init_db() имеет право только ДОБАВЛЯТЬ столбцы.
+
+    Обобщает test_users_employee_full_name_additive_migration и
+    test_base_active_doc_types_additive_migration на все таблицы сразу:
+    после многократных запусков ни одна таблица не исчезает и ни один
+    столбец не удаляется и не меняет type/NOT NULL/default/pk. Отдельно
+    проверяется идемпотентность: на 2-м и 3-м запуске схема уже не растёт.
+    """
+    tmp = tempfile.mkdtemp(prefix="schema_drift_")
+    path = os.path.join(tmp, "drift.db")
+    monkeypatch.setattr(db, "_DB_PATH", path)
+
+    db.init_db()
+    before = _schema_snapshot(path)
+    assert {"users", "bases", "norms", "employees"} <= set(before), (
+        f"ожидались все таблицы, есть: {sorted(before)}"
+    )
+
+    db.init_db()
+    second = _schema_snapshot(path)
+    db.init_db()
+    third = _schema_snapshot(path)
+
+    # 1) Ничего не удалено и не изменено — только аддитивность.
+    for table, cols in before.items():
+        assert table in second, f"таблица {table} исчезла при миграции"
+        for name, meta in cols.items():
+            assert name in second[table], f"столбец {table}.{name} удалён"
+            assert second[table][name] == meta, (
+                f"{table}.{name} изменён: {meta} -> {second[table][name]}"
+            )
+    # 2) Идемпотентность: столбцы не добавляются на каждом запуске.
+    assert second == third, "миграции не идемпотентны: схема продолжает расти"
+
+
+def test_init_db_preserves_legacy_norms_data(monkeypatch):
+    """Старая таблица norms доращивается, а её данные не трогаются."""
+    tmp = tempfile.mkdtemp(prefix="norms_legacy_")
+    path = os.path.join(tmp, "legacy.db")
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE norms ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "doc_type TEXT NOT NULL, category TEXT NOT NULL, title TEXT NOT NULL, "
+        "entity TEXT NOT NULL, unit TEXT, norm_min REAL NOT NULL, "
+        "norm_hours REAL NOT NULL, coeff REAL NOT NULL DEFAULT 1.00, "
+        "sno TEXT, date_from TEXT, date_to TEXT, comment TEXT, "
+        "sort_order INTEGER NOT NULL DEFAULT 0, "
+        "active INTEGER NOT NULL DEFAULT 1, UNIQUE (doc_type))"
+    )
+    conn.execute(
+        "INSERT INTO norms (doc_type, category, title, entity, "
+        "norm_min, norm_hours, coeff) "
+        "VALUES ('bank_incoming', 'Банк', 'Поступление', 'Document_X', "
+        "60.0, 1.0, 1.25)"
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(db, "_DB_PATH", path)
+    db.init_db()
+
+    added = ("is_discovered", "discovered_at", "has_responsible_key",
+             "has_author_key", "has_operation_type", "variant_rules_json",
+             "ref_base")
+    snap = _schema_snapshot(path)["norms"]
+    for column in added:
+        assert column in snap, f"миграция не добавила столбец {column}"
+
+    norm = db.get_norm(doc_type="bank_incoming")
+    assert norm["title"] == "Поступление"
+    assert norm["norm_hours"] == 1.0
+    assert norm["coeff"] == 1.25
+    assert norm["is_discovered"] is False
+    assert norm["discovered_at"] is None
+    assert norm["ref_base"] is None
+
+
+def test_norm_row_projection_exposes_discovery_columns(clean_db):
+    """get_norm/list_norms отдают все столбцы проекции согласованно.
+
+    Регрессия на позиционный сдвиг: раньше _norm_row собирал словарь по
+    row[0]..row[14], и любое добавление столбца в SELECT молча смещало бы
+    соответствие (тот же класс ошибки, что при удалении bases.group).
+    """
+    db.insert_discovered_norm(
+        doc_type="projection_check", category="К", title="Проверка",
+        entity="Document_Проверка", ref_base="https://donor/1",
+        has_author_key=True,
+    )
+    from_db = db.get_norm(doc_type="projection_check")
+    from_list = next(
+        n for n in db.list_norms(active_only=False)
+        if n["doc_type"] == "projection_check"
+    )
+
+    assert set(from_db) == set(db._NORMS_COLUMNS) == set(from_list)
+    for column in db._NORMS_COLUMNS:
+        assert from_db[column] == from_list[column], (
+            f"расхождение в столбце {column}: "
+            f"{from_db[column]!r} != {from_list[column]!r}"
+        )
+    # Ключевые значения не сместились на соседние столбцы.
+    assert from_db["title"] == "Проверка"
+    assert from_db["ref_base"] == "https://donor/1"
+    assert from_db["has_author_key"] is True
+    assert from_db["has_responsible_key"] is False
+    assert from_db["is_discovered"] is True
+    assert from_db["active"] is True
+    assert isinstance(from_db["norm_hours"], float)
+
+
+# ============ insert_discovered_norm(): «ПРОПУСТИТЬ, ЕСТЬ» ================
+
+def test_insert_discovered_norm_creates_net_new(clean_db):
+    created = db.insert_discovered_norm(
+        doc_type="brand_new", category="Категория", title="Новый вид",
+        entity="Document_Новый", ref_base="https://donor/a/1",
+        has_responsible_key=True, has_operation_type=True,
+    )
+    assert created is True
+
+    norm = db.get_norm(doc_type="brand_new")
+    assert norm["title"] == "Новый вид"
+    assert norm["entity"] == "Document_Новый"
+    assert norm["ref_base"] == "https://donor/a/1"
+    assert norm["is_discovered"] is True
+    assert norm["has_responsible_key"] is True
+    assert norm["has_author_key"] is False
+    assert norm["has_operation_type"] is True
+    # Нет нормы -> 0.0: find_missing_norms() считает нулевую норму «не заданной».
+    assert norm["norm_hours"] == 0.0
+    assert norm["norm_min"] == 0.0
+    assert norm["active"] is True
+    assert norm["variant_rules_json"] == "{}"
+    # UTC ISO8601
+    assert norm["discovered_at"].endswith("+00:00")
+
+
+def test_insert_discovered_norm_skips_existing_preserving_admin_values(clean_db):
+    """Главный инвариант: сканер НИКОГДА не перезаписывает админские значения.
+
+    У insert_discovered_norm намеренно НЕТ параметров norm_hours/norm_min/coeff:
+    сканер не имеет права приносить значения норм. Даже при существующей строке
+    (которую upsert_norm перезаписал бы целиком) вставка пропускается.
+    """
+    db.upsert_norm(
+        doc_type="keeper", category="К", title="Админский заголовок",
+        entity="Document_Keep", norm_hours=1.5, coeff=2.0,
+        comment="настроен вручную",
+    )
+    assert "norm_hours" not in db.insert_discovered_norm.__code__.co_varnames
+
+    created = db.insert_discovered_norm(
+        doc_type="keeper", category="Чужая категория",
+        title="Заголовок сканера", entity="Document_Keep",
+        ref_base="https://donor/other",
+    )
+
+    assert created is False, "существующий doc_type должен быть пропущен"
+    norm = db.get_norm(doc_type="keeper")
+    assert norm["title"] == "Админский заголовок"
+    assert norm["category"] == "К"
+    assert norm["norm_hours"] == 1.5
+    assert norm["coeff"] == 2.0
+    assert norm["comment"] == "настроен вручную"
+    # ref_base не переписан: приоритет у первого обнаружившего донора.
+    assert norm["ref_base"] is None
+    assert norm["is_discovered"] is False
+
+
+def test_insert_discovered_norm_empty_title_falls_back_to_doc_type(clean_db):
+    """Пустой title подменяется на doc_type.
+
+    find_missing_norms() сопоставляет norm['title'] с полем «Вид документа»,
+    поэтому пустой заголовок сделал бы строку невидимой для предупреждения.
+    """
+    db.insert_discovered_norm(doc_type="title_missing", title="   ")
+    assert db.get_norm(doc_type="title_missing")["title"] == "title_missing"
+
+    db.insert_discovered_norm(doc_type="title_missing2")
+    assert db.get_norm(doc_type="title_missing2")["title"] == "title_missing2"
+
+
+def test_insert_discovered_norm_requires_doc_type(clean_db):
+    for bad in ("", "   ", None):
+        with pytest.raises(ValueError):
+            db.insert_discovered_norm(doc_type=bad)
+
+
+def test_insert_discovered_norm_rejects_malformed_json(clean_db):
+    """Битый variant_rules_json не должен доходить до СУБД."""
+    for bad in ('{"broken"', '"строка"', "123", "{oops}"):
+        with pytest.raises(ValueError):
+            db.insert_discovered_norm(doc_type="bad_json", variant_rules_json=bad)
+    assert db.get_norm(doc_type="bad_json") is None
+
+    # Валидный JSON принимается и сохраняется как есть.
+    db.insert_discovered_norm(
+        doc_type="good_json", variant_rules_json='{"terms": ["x"], "to": "y"}'
+    )
+    saved = db.get_norm(doc_type="good_json")["variant_rules_json"]
+    assert json.loads(saved) == {"terms": ["x"], "to": "y"}
+
+
+def test_insert_discovered_norm_is_idempotent(clean_db):
+    """Повторный вызов не создаёт второй строки и не трогает первую."""
+    first = db.insert_discovered_norm(doc_type="once", ref_base="https://donor/1")
+    second = db.insert_discovered_norm(doc_type="once", ref_base="https://donor/2")
+    assert first is True
+    assert second is False
+
+    rows = [n for n in db.list_norms(active_only=False) if n["doc_type"] == "once"]
+    assert len(rows) == 1
+    assert rows[0]["ref_base"] == "https://donor/1"

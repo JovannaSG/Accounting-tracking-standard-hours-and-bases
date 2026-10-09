@@ -8,10 +8,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from core import config
+
 logger = logging.getLogger(__name__)
 
-ENABLE_REGISTRY_SCANNER = False
-REGISTRY_SOURCE = "json"  # 'json' | 'metadata' (default 'json' per requirements)
+# Флаги живут в core/config.py (единая точка правды). Раньше здесь были свои
+# ENABLE_REGISTRY_SCANNER и REGISTRY_SOURCE, из-за чего значения расходились
+# с config-модулем, а core/config.py ещё и не компилировался.
 
 # Track 2 denylist (apply to Document_* only as per requirements)
 DOCUMENT_DENYLIST_PREFIXES: tuple[str, ...] = ("Document_",)
@@ -49,7 +52,7 @@ def compute_registry_diff(
         "meta": {
             "document_only": True,
             "denylist_applied": True,
-            "gated": not ENABLE_REGISTRY_SCANNER,
+            "gated": not config.ENABLE_REGISTRY_SCANNER,
         },
     }
     # TODO: implement diff logic once parser proven

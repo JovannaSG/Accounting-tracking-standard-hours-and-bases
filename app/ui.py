@@ -1,4 +1,6 @@
+import json
 import os
+import re
 import sys
 import time
 
@@ -9,7 +11,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from core import auth, db
+from core import auth, config, db
 from core.api_client import OneCClient
 from core.norms import load_doc_types, seed_default_norms, DEFAULT_NORMS_HOURS
 from core.fetch import fetch_documents, unmapped_user_names
@@ -902,6 +904,330 @@ def render_norms_tab():
     if st.button("Засеять нормы по умолчанию"):
         inserted = seed_default_norms()
         st.success(f"Добавлено норм: {inserted}")
+
+    # Панель сканирования реестра строго за флагом: при выключенном
+    # ENABLE_REGISTRY_SCANNER не рендерится вовсе (а не показывается
+    # отключённой). Поднимается после «Действия», чтобы не менять порядок
+    # уже привычных блоков раздела.
+    if config.ENABLE_REGISTRY_SCANNER:
+        _render_registry_scanner()
+
+
+# Ключ нового вида документа: начинается с латинской буквы, дальше латиница,
+# цифры и подчёркивание. Проверка на практике: все 30 ключей из
+# core/doc_types.json этому правилу удовлетворяют.
+_DOC_TYPE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+# Префиксы сущностей 1С, которые убираются из имени при подсказке title.
+_ENTITY_PREFIXES: tuple[str, ...] = (
+    "InformationRegister_", "AccumulationRegister_", "Document_", "Catalog_",
+)
+
+
+def _scan_cell(record: dict, key: str) -> str:
+    """Значение ячейки data_editor как непустая строка (NaN/None -> '')."""
+    value = record.get(key)
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return str(value).strip()
+
+
+def _render_registry_scanner() -> None:
+    """Сканирование реестра донорской базы: только чтение, добавление новое.
+
+    Никогда не перезаписывает существующие нормы — это делает
+    db.insert_discovered_norm() (ON CONFLICT DO NOTHING).
+    """
+    st.markdown("---")
+    st.subheader("Сканирование реестра")
+    st.caption(
+        "Сравнивает состав донорской базы с реестром и предлагает только "
+        "новые виды документов. Существующие нормы не изменяются."
+    )
+
+    bases = _visible_databases(_list_bases_or_error(active_only=True, where=None))
+    if not bases:
+        st.info("Нет доступных баз-доноров.")
+        return
+    options = {b["name"]: b for b in bases}
+    donor = options[st.selectbox(
+        "Донорская база",
+        list(options),
+        key="scan_donor_base",
+        help="База, из которой читаются виды документов для сравнения.",
+    )]
+    donor_id = donor.get("id")
+    donor_url = donor.get("url") or ""
+
+    # --- Инвалидация при смене донора ----------------------------------
+    # diff хранится в session_state. Если пользователь переключился с базы A
+    # на B, а diff от A остался, то сохранение ушло бы в B с чужими
+    # данными. Поэтому при несовпадении id донора накопленный diff
+    # и его строкевые ключи выбрасываются: пользователь обязан просканировать
+    # уже выбранную базу.
+    if st.session_state.get("scan_donor_id") != donor_id:
+        st.session_state.pop("scan_diff", None)
+        st.session_state.pop("scan_result", None)
+        for key in list(st.session_state.keys()):
+            if str(key).startswith("scan_edits"):
+                del st.session_state[key]
+        st.session_state["scan_donor_id"] = donor_id
+
+    # Итог сохранения переживает st.rerun(): ст.error()/st.success() и блок
+    # сниппетов, отрисованные до rerun, затирались бы следующим прогоном и
+    # администратор не увидел бы ни ошибки строк, ни код для doc_types.json.
+    result = st.session_state.pop("scan_result", None)
+    if result:
+        summary = (
+            f"Добавлено: {result['inserted']} · "
+            f"Пропущено (уже есть): {result['skipped']}"
+        )
+        if result["errors"]:
+            st.error(
+                f"{summary} · Ошибок: {len(result['errors'])}\n\n"
+                + "\n".join(result["errors"])
+            )
+        else:
+            st.success(summary)
+        _render_manifest_snippets(result["snippets"])
+
+    if st.button(
+        "Сканировать реестр", key="scan_run", disabled=not donor_url
+    ):
+        st.session_state.pop("scan_diff", None)
+        with st.spinner("Чтение $metadata донорской базы..."):
+            try:
+                client = OneCClient(
+                    donor_url, donor.get("login") or "",
+                    donor.get("password") or "",
+                )
+                props = client.fetch_metadata_entity_properties()
+            except Exception as e:  # noqa: BLE001 - показываем как есть
+                st.error(f"Скан не выполнен: {e}")
+                st.rerun()
+        st.session_state["scan_diff"] = _build_scan_diff(donor, props)
+        st.rerun()
+
+    rows = st.session_state.get("scan_diff")
+    if rows is None:
+        st.caption("Нажмите «Сканировать реестр», чтобы увидеть новые виды.")
+        return
+    if not rows:
+        st.success("Новых видов документов в донорской базе не найдено.")
+        return
+
+    st.caption(
+        f"Новых видов: **{len(rows)}**. Сущность и источник не редактируются, "
+        "ключ **doc_type** — заполните латиницей."
+    )
+    edited = st.data_editor(
+        pd.DataFrame(rows),
+        num_rows="fixed",           # нельзя добавлять и удалять строки
+        hide_index=True,
+        use_container_width=True,
+        key="scan_edits",
+        # doc_type НАМЕРЕННО не заблокирован: связь entity -> doc_type
+        # одно-ко-многим (один entity обслуживает несколько ключей), поэтому
+        # вывести его автоматически нельзя — ключ вводит администратор.
+        disabled=["entity", "ref_base"],
+        column_config={
+            "doc_type": st.column_config.TextColumn(
+                "Ключ (doc_type)",
+                help=(
+                    "Латиница, цифры и подчёркивание; с буквы. "
+                    "Например: dismissal. Предзаполнен именем сущности — "
+                    "замените его на осмысленный ключ."
+                ),
+                required=True,
+            ),
+            "title": st.column_config.TextColumn(
+                "Наименование для отчёта",
+                help="Попадёт в поле «Вид документа» через doc_types.json.",
+            ),
+            "variant_rules_json": st.column_config.TextColumn(
+                "Правила вариантов (JSON)",
+                help='Объект или массив JSON, по умолчанию "{}".',
+            ),
+        },
+    )
+
+    if not st.button("Добавить новые виды", key="scan_save"):
+        return
+
+    # --- Валидация и вставка -------------------------------------------
+    # Правила на КАЖДУЮ строку независимо друг от друга:
+    #   1. ключ doc_type — непустой и латинский (иначе манифест не собрать);
+    #   2. json.loads в try/except — невалидный JSON не доходит до СУБД;
+    #   3. ошибка одной строки не блокирует остальные: счётчик ошибок
+    #      растёт, строка пропускается.
+    inserted = 0
+    skipped = 0
+    errors: list[str] = []
+    snippets: dict[str, dict] = {}
+    records = edited.to_dict("records") if edited is not None else []
+    for record in records:
+        doc_type = _scan_cell(record, "doc_type")
+        if not doc_type:
+            errors.append("строка без ключа: заполните doc_type")
+            continue
+        if not _DOC_TYPE_RE.fullmatch(doc_type):
+            errors.append(
+                f"«{doc_type}»: ключ должен начинаться с латинской буквы и "
+                "содержать только латиницу, цифры и подчёркивание"
+            )
+            continue
+
+        vjson = _scan_cell(record, "variant_rules_json") or "{}"
+        try:
+            json.loads(vjson)
+        except (TypeError, ValueError) as e:
+            errors.append(f"«{doc_type}»: некорректный JSON правил — {e}")
+            continue
+        try:
+            created = db.insert_discovered_norm(
+                doc_type=doc_type,
+                category=_scan_cell(record, "category"),
+                title=_scan_cell(record, "title"),
+                entity=_scan_cell(record, "entity"),
+                unit=_scan_cell(record, "unit") or None,
+                ref_base=donor_url,
+                variant_rules_json=vjson,
+                has_responsible_key=bool(record.get("has_responsible_key")),
+                has_author_key=bool(record.get("has_author_key")),
+                has_operation_type=bool(record.get("has_operation_type")),
+            )
+        except ValueError as e:
+            errors.append(f"«{doc_type}»: {e}")
+            continue
+        if created:
+            inserted += 1
+            snippets[doc_type] = {
+                "entity": _scan_cell(record, "entity"),
+                "title": _scan_cell(record, "title") or doc_type,
+                "category": _scan_cell(record, "category"),
+                "unit": _scan_cell(record, "unit") or "документ",
+            }
+        else:
+            skipped += 1
+
+    # В diff остаются только строки с ошибками: остальные либо уже есть
+    # в реестре (пропущены), либо только что добавлены. Если не осталось
+    # ничего — diff чистится целиком, иначе пустой список подсказал бы
+    # «в донорской базе нет новых видов», хотя причина в успешном сохранении.
+    if inserted or skipped:
+        failed = {
+            e.split("»", 1)[0].lstrip("«") for e in errors
+        }
+        left = [
+            r for r in records
+            if _scan_cell(r, "doc_type") in failed or not _scan_cell(r, "doc_type")
+        ]
+        if left:
+            st.session_state["scan_diff"] = left
+        else:
+            st.session_state.pop("scan_diff", None)
+            for key in list(st.session_state.keys()):
+                if str(key).startswith("scan_edits"):
+                    del st.session_state[key]
+
+    st.session_state["scan_result"] = {
+        "inserted": inserted,
+        "skipped": skipped,
+        "errors": errors,
+        "snippets": snippets,
+    }
+    st.rerun()
+
+
+def _render_manifest_snippets(snippets: dict[str, dict]) -> None:
+    """Готовый блок для core/doc_types.json по успешно добавленным видам.
+
+    Файл намеренно НЕ изменяется программно: core/doc_types.json под
+    версионным контролем, и запись в него из запущенного Streamlit
+    неминуемо конфликтует при следующем git pull.
+    """
+    if not snippets:
+        return
+    st.warning(
+        "Нормы добавлены в базу, но отчёты подхватят их только после "
+        "регистрации вида в `core/doc_types.json`. Вставьте блок в этот файл "
+        "(между существующими ключами) и перезапустите приложение:",
+        icon="⚠️",
+    )
+    # json.dumps, а не f-строка: наименования содержат кавычки и спецсимволы,
+    # а собранный руками фрагмент должен быть валидным JSON.
+    st.code(json.dumps(snippets, ensure_ascii=False, indent=2), language="json")
+
+
+def _build_scan_diff(donor: dict, props: dict) -> list[dict]:
+    """Сущности донора, которых нет в манифесте core/doc_types.json.
+
+    doc_type здесь НЕ выводится из имени сущности. Связь entity -> doc_type
+    одно-ко-многим: один entity обслуживает несколько ключей (например,
+    Document_ПоступлениеНаРасчетныйСчет закрывает и bank_incoming, и
+    bank_incoming_manual), поэтому обратный вывод дал бы неверный ключ.
+
+    Вместо этого поле doc_type подставляется именем сущности как ПРЕДЗАПОЛНЕНИЕ
+    и остаётся редактируемым — латинский ключ обязан выбрать администратор.
+    Пустые строки не сохраняются: до вставки ключ проверяется на
+    _DOC_TYPE_RE.
+
+    Существующие в манифесте сущности в diff не попадают вообще, а если по
+    введённому ключу норма уже есть, её пропустит insert_discovered_norm()
+    (ON CONFLICT DO NOTHING) — правило «пропустить, если есть».
+    """
+    from core.norms import load_doc_types
+
+    doc_types = load_doc_types()
+    mapped_entities = {
+        spec.get("entity")
+        for spec in (doc_types or {}).values()
+        if spec and spec.get("entity")
+    }
+    known = {n["doc_type"] for n in db.list_norms(active_only=False)}
+
+    candidates = []
+    for entity_name in sorted(props or {}):
+        if not entity_name or entity_name in mapped_entities:
+            continue
+        if entity_name in known:
+            continue
+        info = props[entity_name] or {}
+        properties = info.get("properties") or set()
+        candidates.append({
+            "doc_type": entity_name,   # предзаполнение, редактируется админом
+            "title": _entity_label(entity_name),
+            "category": "Обнаружено сканером",
+            "entity": entity_name,     # заблокировано: берётся из 1С
+            "unit": "документ",
+            "variant_rules_json": "{}",
+            "ref_base": donor.get("url") or "",
+            "has_responsible_key": _has_prop(properties, "Responsible"),
+            "has_author_key": _has_prop(properties, "Author"),
+            "has_operation_type": _has_prop(properties, "OperationType"),
+        })
+    return candidates
+
+
+def _entity_label(entity_name: str) -> str:
+    """Человекочитаемая подсказка для title: имя сущности без префикса 1С.
+
+    Document_Увольнение -> Увольнение. Администратор правит наименование
+    так, чтобы оно совпадало с тем, что реально видно в отчёте.
+    """
+    for prefix in _ENTITY_PREFIXES:
+        if entity_name.startswith(prefix):
+            return entity_name[len(prefix):] or entity_name
+    return entity_name
+
+
+def _has_prop(properties, prefix: str) -> bool:
+    """Есть ли в сущности свойство с данным префиксом (регистронезависимо)."""
+    needle = prefix.lower()
+    for name in properties:
+        if str(name).lower() == needle or str(name).lower().startswith(needle):
+            return True
+    return False
 
 
 # bases: list[dict]

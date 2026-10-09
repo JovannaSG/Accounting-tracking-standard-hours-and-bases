@@ -924,3 +924,214 @@ def test_newly_created_norm_appears_in_editor(clean_db):
     at = _run_app()
     pick = at.selectbox(key="norm_pick")
     assert any("act_sverki" in str(o) for o in pick.options)
+
+
+# ================== СКАНЕР РЕЕСТРА: ГЕЙТ И СЕССИОННОЕ СОСТОЯНИЕ ============
+
+def _subheader_labels(at) -> list[str]:
+    # HeadingBase.value возвращает proto.body; атрибута label у заголовков нет.
+    return [s.value for s in at.subheader]
+
+
+@pytest.fixture
+def scanner_enabled():
+    """Включает панель сканирования и возвращает флаг обратно."""
+    from core import config
+    original = config.ENABLE_REGISTRY_SCANNER
+    config.ENABLE_REGISTRY_SCANNER = True
+    yield
+    config.ENABLE_REGISTRY_SCANNER = original
+
+
+def _make_donor(name: str) -> dict:
+    return db.insert_base(
+        name=name, url=f"https://{name}.example/odata",
+        login="odata.user", password="pw",
+    )
+
+
+def test_scanner_panel_absent_when_flag_disabled(clean_db):
+    """ENABLE_REGISTRY_SCANNER=0 -> панели нет вообще, а не disabled-состояние."""
+    from core import config
+    config.ENABLE_REGISTRY_SCANNER = False
+
+    at = _run_app()
+    assert not at.exception
+    assert not any("Сканирование реестра" in l for l in _subheader_labels(at))
+    assert not _has_key(at, "button", "scan_run")
+    assert not _has_key(at, "button", "scan_save")
+    assert not _has_key(at, "selectbox", "scan_donor_base")
+
+
+def test_scanner_panel_present_when_flag_enabled(clean_db, scanner_enabled):
+    _make_donor("donor_ok")
+    at = _run_app()
+    assert not at.exception
+    labels = _subheader_labels(at)
+
+    assert any("Сканирование реестра" in l for l in labels), labels
+    assert _has_key(at, "button", "scan_run")
+    assert _has_key(at, "selectbox", "scan_donor_base")
+    # Панель добавлена ПОСЛЕ существующих блоков — их порядок не сдвинулся.
+    assert labels.index("Сканирование реестра") > labels.index("Действия")
+    assert labels.index("Сканирование реестра") > labels.index("Редактирование")
+
+
+def test_scanner_hidden_without_bases(clean_db, scanner_enabled):
+    """Пустая БЗ: панель есть, но явно сообщает, что доноров нет."""
+    at = _run_app()
+    assert not at.exception
+    assert any("Сканирование реестра" in l for l in _subheader_labels(at))
+    # Нет ни кнопки скана, ни выбора донора — только пояснение.
+    assert not _has_key(at, "button", "scan_run")
+    assert not _has_key(at, "selectbox", "scan_donor_base")
+
+
+def test_donor_change_discards_stale_diff(clean_db, scanner_enabled):
+    """Смена донора выбрасывает diff, накопленный для предыдущей базы.
+
+    Иначе сохранение по базе A ушло бы в базу B с чужими данными.
+    """
+    a = _make_donor("donor_a")
+    b = _make_donor("donor_b")
+
+    at = _run_app()
+    assert not at.exception
+
+    # Имитируем «уже просканировали» для донора B и оставшийся чужой diff.
+    at.session_state["scan_donor_id"] = b["id"]
+    at.session_state["scan_diff"] = [
+        {"doc_type": "stale_from_b", "title": "Чужой", "entity": "Document_X",
+         "category": "К", "unit": "документ", "variant_rules_json": "{}",
+         "ref_base": "https://donor_b.example/odata",
+         "has_responsible_key": False, "has_author_key": False,
+         "has_operation_type": False},
+    ]
+
+    # Переключаемся на донора A.
+    at.selectbox(key="scan_donor_base").select("donor_a")
+    at.run()
+    assert not at.exception
+
+    assert at.session_state.get("scan_donor_id") == a["id"]
+    assert at.session_state.get("scan_diff") is None, (
+        "diff от предыдущего донора пережил смену донора"
+    )
+
+
+def test_same_donor_keeps_diff(clean_db, scanner_enabled):
+    """При сохранении донора накопленный diff не выбрасывается."""
+    a = _make_donor("keep_a")
+
+    at = _run_app()
+    assert not at.exception
+
+    at.session_state["scan_donor_id"] = a["id"]
+    at.session_state["scan_diff"] = [{"doc_type": "kept", "title": "К"}]
+
+    at.selectbox(key="scan_donor_base").select("keep_a")
+    at.run()
+    assert not at.exception
+
+    assert at.session_state.get("scan_donor_id") == a["id"]
+    assert at.session_state.get("scan_diff") == [{"doc_type": "kept", "title": "К"}]
+
+
+def test_save_loop_validates_key_and_json_per_row(clean_db, scanner_enabled):
+    """Цикл сохранения: ошибочная строка не блокирует остальные.
+
+    Проверяются три независимых правила на каждой строке:
+      - латинский ключ doc_type;
+      - валидный variant_rules_json;
+      - до СУБД не доходит ничего некорректного.
+    """
+    donor = _make_donor("donor_save")
+    at = _run_app()
+    assert not at.exception
+
+    at.session_state["scan_donor_id"] = donor["id"]
+    at.session_state["scan_diff"] = [
+        # 1) корректная: должна добавиться
+        {"doc_type": "brand_new_key", "title": "Новый вид", "entity": "Document_Новый",
+         "category": "К", "unit": "документ", "variant_rules_json": "{}",
+         "ref_base": donor["url"], "has_responsible_key": False,
+         "has_author_key": False, "has_operation_type": False},
+        # 2) кириллический ключ: ошибка валидации, до JSON даже не доходит
+        {"doc_type": "Document_Увольнение", "title": "Увольнение",
+         "entity": "Document_Увольнение", "category": "К", "unit": "документ",
+         "variant_rules_json": "{}", "ref_base": donor["url"],
+         "has_responsible_key": False, "has_author_key": False,
+         "has_operation_type": False},
+        # 3) битый JSON
+        {"doc_type": "bad_json_key", "title": "Битый", "entity": "Document_Битый",
+         "category": "К", "unit": "документ", "variant_rules_json": "{oops",
+         "ref_base": donor["url"], "has_responsible_key": False,
+         "has_author_key": False, "has_operation_type": False},
+    ]
+    # Прогон после записи в session_state: без него кнопка «Добавить» ещё
+    # не отрисована, потому что diff появляется только на следующем прогоне.
+    at.run()
+    assert not at.exception
+    assert _has_key(at, "button", "scan_save")
+
+    at.button(key="scan_save").click()
+    at.run()
+    assert not at.exception
+
+    # Добавилась только корректная строка.
+    assert db.get_norm(doc_type="brand_new_key") is not None
+    assert db.get_norm(doc_type="Document_Увольнение") is None
+    assert db.get_norm(doc_type="bad_json_key") is None
+
+    # Счётчик ошибок ровно 2, обе причины названы.
+    errors = [e.value for e in at.error]
+    assert errors, "ожидалось сообщение об ошибках валидации"
+    text = "\n".join(errors)
+    assert "Ошибок: 2" in text
+    assert "Document_Увольнение" in text
+    assert "bad_json_key" in text
+    # Добавленная строка учтена.
+    assert "Добавлено: 1" in text
+
+    # В diff остались только строки с ошибками (добавленная убрана).
+    remaining = {
+        r.get("doc_type") for r in (at.session_state.get("scan_diff") or [])
+    }
+    assert "brand_new_key" not in remaining
+    assert remaining == {"Document_Увольнение", "bad_json_key"}
+
+
+def test_save_loop_never_overwrites_existing_norm(clean_db, scanner_enabled):
+    """Сохранение не может изменить норму, заведённую администратором."""
+    donor = _make_donor("donor_guard")
+    db.upsert_norm(
+        doc_type="guarded", category="К", title="Админский заголовок",
+        entity="Document_Guard", norm_hours=1.5, coeff=2.0,
+    )
+
+    at = _run_app()
+    assert not at.exception
+    at.session_state["scan_donor_id"] = donor["id"]
+    at.session_state["scan_diff"] = [
+        {"doc_type": "guarded", "title": "Заголовок сканера",
+         "entity": "Document_Guard", "category": "Чужая",
+         "unit": "документ", "variant_rules_json": "{}", "ref_base": donor["url"],
+         "has_responsible_key": False, "has_author_key": False,
+         "has_operation_type": False},
+    ]
+    at.run()
+    assert not at.exception
+    assert _has_key(at, "button", "scan_save")
+
+    at.button(key="scan_save").click()
+    at.run()
+    assert not at.exception
+
+    norm = db.get_norm(doc_type="guarded")
+    assert norm["title"] == "Админский заголовок"
+    assert norm["norm_hours"] == 1.5
+    assert norm["coeff"] == 2.0
+    assert norm["category"] == "К"
+    # И это засчитано как пропуск, а не как ошибка.
+    assert "Пропущено (уже есть): 1" in "\n".join(e.value for e in at.error) or \
+           "Пропущено (уже есть): 1" in "\n".join(s.value for s in at.success)

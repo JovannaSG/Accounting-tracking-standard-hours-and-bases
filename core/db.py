@@ -4,7 +4,7 @@ import json
 import os
 import secrets
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Позволяем тестам использовать временный файл через переменную окружения
 _DB_PATH = os.environ.get(
@@ -272,6 +272,11 @@ def init_db():
         cursor.execute("ALTER TABLE norms ADD COLUMN has_operation_type INTEGER NOT NULL DEFAULT 0")
     if "variant_rules_json" not in existing_norms:
         cursor.execute("ALTER TABLE norms ADD COLUMN variant_rules_json TEXT")
+    if "ref_base" not in existing_norms:
+        # Донорская база, из которой впервые увиден вида документа
+        # (только URL). Аддон к is_discovered/discovered_at — без flags JSON,
+        # чтобы не было двух конкурирующих представлений одного признака.
+        cursor.execute("ALTER TABLE norms ADD COLUMN ref_base TEXT")
 
     # Соответствие «Сотрудник аутсорсера -> Пользователь 1С» (ТЗ §3.3)
     cursor.execute("""
@@ -983,6 +988,29 @@ def import_bases(entries: list[dict], active: bool = True) -> dict:
 
 # =============================== НОРМЫ =====================================
 
+# Единая проекция столбцов norms для чтения.
+#
+# _norm_row строит словарь через zip с этим кортежем, а не по позиционным
+# индексам: раньше всё читалось явным списком из 14 столбцов, и любое
+# добавление столбца без параллельной правки _norm_row молча смещало
+# соответствие (тот же класс ошибки, что произошёл при удалении bases.group).
+_NORMS_COLUMNS: tuple[str, ...] = (
+    "id", "doc_type", "category", "title", "entity", "unit",
+    "norm_min", "norm_hours", "coeff", "sno", "date_from", "date_to",
+    "comment", "sort_order", "active",
+    # Столбцы обнаружения реестра (аддитивные миграции ниже в init_db())
+    "ref_base", "is_discovered", "discovered_at",
+    "has_responsible_key", "has_author_key", "has_operation_type",
+    "variant_rules_json",
+)
+
+# Признаки обнаружения: приводятся к bool при чтении.
+_NORMS_BOOL_COLUMNS: tuple[str, ...] = (
+    "active", "is_discovered",
+    "has_responsible_key", "has_author_key", "has_operation_type",
+)
+
+
 def list_norms(category: str | None = None, active_only: bool = True) -> list[dict]:
     """
     Возвращает нормы трудозатрат. При category — только этой категории.
@@ -991,9 +1019,7 @@ def list_norms(category: str | None = None, active_only: bool = True) -> list[di
     init_db()
     conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
-    sql = "SELECT id, doc_type, category, title, entity, unit, norm_min, " \
-          "norm_hours, coeff, sno, date_from, date_to, comment, sort_order, active " \
-          "FROM norms"
+    sql = "SELECT " + ", ".join(_NORMS_COLUMNS) + " FROM norms"
     cond: list[str] = []
     params: list = []
     if category:
@@ -1018,20 +1044,11 @@ def get_norm(doc_type: str | None = None, norm_id: int | None = None) -> dict | 
     init_db()
     conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
+    _cols = "SELECT " + ", ".join(_NORMS_COLUMNS) + " FROM norms"
     if norm_id is not None:
-        cursor.execute(
-            "SELECT id, doc_type, category, title, entity, unit, norm_min, "
-            "norm_hours, coeff, sno, date_from, date_to, comment, sort_order, active "
-            "FROM norms WHERE id = ?",
-            (norm_id,),
-        )
+        cursor.execute(_cols + " WHERE id = ?", (norm_id,))
     else:
-        cursor.execute(
-            "SELECT id, doc_type, category, title, entity, unit, norm_min, "
-            "norm_hours, coeff, sno, date_from, date_to, comment, sort_order, active "
-            "FROM norms WHERE doc_type = ?",
-            (doc_type,),
-        )
+        cursor.execute(_cols + " WHERE doc_type = ?", (str(doc_type).strip(),))
     row = cursor.fetchone()
     conn.close()
     return _norm_row(row) if row else None
@@ -1103,6 +1120,100 @@ def upsert_norm(
     return get_norm(doc_type=doc_type)
 
 
+def insert_discovered_norm(
+    *,
+    doc_type: str,
+    category: str = "",
+    title: str = "",
+    entity: str = "",
+    unit: str | None = None,
+    ref_base: str | None = None,
+    discovered_at: str | None = None,
+    variant_rules_json: str = "{}",
+    has_responsible_key: bool = False,
+    has_author_key: bool = False,
+    has_operation_type: bool = False,
+) -> bool:
+    """
+    Вставляет впервые обнаруженный в реестре вида документа.
+
+    Семантика — строго «пропустить, если есть» (ON CONFLICT DO NOTHING):
+    задача сканера — показать и добавить только новое, никогда не перезаписывая
+    заголовок или нормочасы, выставленные администратором вручную. Поэтому
+    здесь НЕ используется upsert_norm, который по doc_type всё перезаписывает.
+
+    Возвращает True, если строка создана, и False, если такой doc_type уже
+    существовал и вставка была пропущена.
+
+    Пустой title подменяется на doc_type: find_missing_norms() ищет норму по
+    title, поэтому пустой заголовок сделал бы строку невидимой для
+    предупреждения об отсутствии норм.
+
+    Норма создаётся с norm_hours = 0.0: find_missing_norms() считает нулевую
+    норму «не заданной», поэтому строка корректно попадёт в предупреждение,
+    а не будет молча участвовать в расчёте с нулевыми часами.
+    """
+
+    key = str(doc_type or "").strip()
+    if not key:
+        raise ValueError("insert_discovered_norm: doc_type обязателен")
+
+    try:
+        parsed = json.loads(variant_rules_json) if variant_rules_json else {}
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"insert_discovered_norm: variant_rules_json не является JSON: {e}"
+        ) from e
+    if not isinstance(parsed, (dict, list)):
+        raise ValueError(
+            "insert_discovered_norm: variant_rules_json должен быть "
+            f"объектом или массивом, получен {type(parsed).__name__}"
+        )
+    vjson = json.dumps(parsed, ensure_ascii=False)
+
+    init_db()
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO norms ("
+        "doc_type, category, title, entity, unit, "
+        "norm_min, norm_hours, coeff, sno, date_from, date_to, "
+        "comment, sort_order, active, "
+        "ref_base, is_discovered, discovered_at, "
+        "has_responsible_key, has_author_key, has_operation_type, "
+        "variant_rules_json"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(doc_type) DO NOTHING",
+        (
+            key,
+            str(category or "").strip(),
+            str(title or "").strip() or key,
+            str(entity or "").strip(),
+            str(unit).strip() if unit else None,
+            0.0,
+            0.0,
+            1.00,
+            None,
+            None,
+            None,
+            None,
+            0,
+            1,
+            (str(ref_base).strip() if ref_base else None),
+            1,
+            discovered_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            int(bool(has_responsible_key)),
+            int(bool(has_author_key)),
+            int(bool(has_operation_type)),
+            vjson,
+        ),
+    )
+    inserted = cursor.rowcount == 1
+    conn.commit()
+    conn.close()
+    return inserted
+
+
 def delete_norm(doc_type: str) -> bool:
     """
     Удаляет норму по ключу вида документа. Возвращает True при удалении.
@@ -1129,23 +1240,17 @@ def count_norms() -> int:
 
 
 def _norm_row(row) -> dict:
-    return {
-        "id": row[0],
-        "doc_type": row[1],
-        "category": row[2],
-        "title": row[3],
-        "entity": row[4],
-        "unit": row[5],
-        "norm_min": row[6],
-        "norm_hours": row[7],
-        "coeff": row[8],
-        "sno": row[9],
-        "date_from": row[10],
-        "date_to": row[11],
-        "comment": row[12],
-        "sort_order": row[13],
-        "active": bool(row[14]),
-    }
+    """Словарь нормы из строки SELECT.
+
+    Позиционируется через _NORMS_COLUMNS, а не по «row[0] .. row[14]»:
+    если добавить столбец в проекцию, словарь обновится сам и не сдвинется.
+    """
+    if row is None:
+        return {}
+    data = dict(zip(_NORMS_COLUMNS, row))
+    for col in _NORMS_BOOL_COLUMNS:
+        data[col] = bool(data.get(col))
+    return data
 
 
 # ============================ СОТРУДНИКИ ===================================
