@@ -35,6 +35,9 @@ DEFAULT_NORMS_HOURS: dict[str, float] = {
     "return_customer": 0.0,
     "customs_declaration": 0.0,
     "payroll_accrual": 0.11,
+    # Ручные операции (блок «Учет доходов, расходов и НДС» базовых норм)
+    "manual_operation": 0.13,
+    "manual_operation_complex": 0.25,
     # Доп. варианты по табличным нормам из документа
     "bank_incoming_manual": 0.10,
     "bank_outgoing_manual": 0.10,

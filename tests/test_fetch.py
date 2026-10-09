@@ -217,3 +217,85 @@ def test_resolve_key_multi_rule_with_field_override():
     assert k == "corr"
     k, _ = _resolve_key(entries, {"КодВидаОперации": "01"})
     assert k == "base"
+
+
+def test_resolve_key_rules_on_soderzhanie():
+    """Ручные операции: маршрутизация по тексту «Содержание» (ОперацияБух).
+
+    Пустое «Содержание» и текст без ключевых слов остаются на базовой норме;
+    ключевое слово уводит документ на вариант сложной корреспонденции.
+    """
+    from core.fetch import _resolve_key
+
+    spec_base = {
+        "entity": "Document_ОперацияБух",
+        "variant_rules": [
+            {"field": "Содержание", "terms": ["аналитик", "сложн"],
+             "to": "manual_operation_complex"},
+        ],
+    }
+    entries = [
+        ("manual_operation", spec_base),
+        ("manual_operation_complex", {"entity": "Document_ОперацияБух"}),
+    ]
+
+    k, _ = _resolve_key(entries, {"Содержание": "Сложная корреспонденция"})
+    assert k == "manual_operation_complex"
+    k, _ = _resolve_key(entries, {"Содержание": "претензия №2860 от 17.09.2025"})
+    assert k == "manual_operation"
+    k, _ = _resolve_key(entries, {"Содержание": ""})
+    assert k == "manual_operation"
+    k, _ = _resolve_key(entries, {})
+    assert k == "manual_operation"
+
+
+def test_fetch_manual_operations_route_by_soderzhanie():
+    """Полный путь: реальный реестр, два ключа на сущность ОперацияБух.
+
+    Документ с ключевыми словами в «Содержании» попадает в вид «с несколькими
+    счетами» (0,25), без совпадения — в «Операция (введенная вручную)» (0,13).
+    """
+    from core.fetch import fetch_documents
+
+    client = FakeClient({
+        "Document_ОперацияБух": [
+            {"Ref_Key": "a", "Date": "2026-01-15T12:00:00", "Number": "ОП-000001",
+             "Posted": True, "Организация_Key": "org1", "Ответственный_Key": "u1",
+             "Содержание": "Зачет авансов по нескольким счетам с аналитикой"},
+            {"Ref_Key": "b", "Date": "2026-01-16T12:00:00", "Number": "ОП-000002",
+             "Posted": True, "Организация_Key": "org1", "Ответственный_Key": "u1",
+             "Содержание": "претензия №2860 от 17.09.2025"},
+        ],
+    })
+    df = fetch_documents(client, "2026-01-01", "2026-01-31", [
+        "manual_operation", "manual_operation_complex",
+    ], sno="УСН «Доходы»")
+
+    rows = df.to_dict(orient="records")
+    titles = [r["Вид документа"] for r in rows]
+    assert titles == [
+        "Операция с несколькими счетами и аналитикой",
+        "Операция (введенная вручную)",
+    ]
+
+
+def test_entity_properties_guard_for_new_entities():
+    """Снимок odata_schema.json даёт guard'у $select правильный набор полей.
+
+    У ОперацияБух есть «Содержание» (источник правил маршрутизации) и нет
+    «ВидОперации»/«СуммаДокумента» — иначе полный $select падал бы в 400 и
+    деградировал до Ref_Key/Date/Number. Запись ГТДИмпорт устраняет ту же
+    тихую деградацию у таможенных деклараций.
+    """
+    from core.api_client import OneCClient
+
+    props = OneCClient("", "", "").entity_properties
+    op = props("Document_ОперацияБух")
+    assert "Содержание" in op
+    assert "Комментарий" in op
+    assert "ВидОперации" not in op
+
+    gtd = props("Document_ГТДИмпорт")
+    assert "Комментарий" in gtd
+    assert "ВидОперации" not in gtd
+    assert "Содержание" not in gtd

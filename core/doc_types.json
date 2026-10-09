@@ -224,5 +224,28 @@
     "title": "Начисление зарплаты",
     "category": "Зарплата и кадры",
     "unit": "документ"
+  },
+  "manual_operation": {
+    "category": "Первичные документы",
+    "title": "Операция (введенная вручную)",
+    "entity": "Document_ОперацияБух",
+    "unit": "документ",
+    "variant_rules": [
+      {
+        "field": "Содержание",
+        "terms": [
+          "нескольких счетов",
+          "аналитик",
+          "сложн"
+        ],
+        "to": "manual_operation_complex"
+      }
+    ]
+  },
+  "manual_operation_complex": {
+    "category": "Первичные документы",
+    "title": "Операция с несколькими счетами и аналитикой",
+    "entity": "Document_ОперацияБух",
+    "unit": "документ"
   }
 }

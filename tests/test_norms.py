@@ -13,8 +13,8 @@ def clean_db():
 
 def test_seed_adds_all_norm_keys(clean_db):
     inserted = seed_default_norms(sno="УСН «Доходы»")
-    assert inserted == 31
-    assert db.count_norms() == 31
+    assert inserted == 33
+    assert db.count_norms() == 33
 
     travel = db.get_norm(doc_type="advance_report_travel")
     assert travel["norm_hours"] == 0.375
@@ -29,11 +29,20 @@ def test_seed_adds_all_norm_keys(clean_db):
     assert customs["norm_hours"] == 0.0
     assert "Норма не задана" in (customs.get("comment") or "")
 
+    manual = db.get_norm(doc_type="manual_operation")
+    assert manual["title"] == "Операция (введенная вручную)"
+    assert manual["entity"] == "Document_ОперацияБух"
+    assert manual["norm_hours"] == 0.13
+
+    complex_manual = db.get_norm(doc_type="manual_operation_complex")
+    assert complex_manual["title"] == "Операция с несколькими счетами и аналитикой"
+    assert complex_manual["norm_hours"] == 0.25
+
 
 def test_seed_is_idempotent(clean_db):
-    assert seed_default_norms() == 31
+    assert seed_default_norms() == 33
     assert seed_default_norms() == 0
-    assert db.count_norms() == 31
+    assert db.count_norms() == 33
 
 
 def test_seed_preserves_admin_hours_and_updates_title(clean_db):

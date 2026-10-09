@@ -1804,6 +1804,94 @@
     "Подразделение",
     "ФизическоеЛицо"
    ]
+  },
+  "Document_ГТДИмпорт": {
+   "key": [
+    "Ref_Key"
+   ],
+   "properties": {
+    "Ref_Key": "Edm.Guid",
+    "DataVersion": "Edm.String",
+    "Number": "Edm.String",
+    "Date": "Edm.DateTime",
+    "DeletionMark": "Edm.Boolean",
+    "Posted": "Edm.Boolean",
+    "Организация_Key": "Edm.Guid",
+    "Контрагент_Key": "Edm.Guid",
+    "ДоговорКонтрагента_Key": "Edm.Guid",
+    "ДоговорКонтрагентаРегл_Key": "Edm.Guid",
+    "ВалютаДокумента_Key": "Edm.Guid",
+    "КурсДокумента": "Edm.Double",
+    "КратностьДокумента": "Edm.Int64",
+    "КурсВзаиморасчетов": "Edm.Double",
+    "КратностьВзаиморасчетов": "Edm.Int64",
+    "НомерГТД_Key": "Edm.Guid",
+    "ТаможенныйСборВал": "Edm.Double",
+    "ТаможенныйСбор": "Edm.Double",
+    "ТаможенныйШтрафВал": "Edm.Double",
+    "ТаможенныйШтраф": "Edm.Double",
+    "СчетУчетаРасчетовСКонтрагентом_Key": "Edm.Guid",
+    "СтатьяПрочихДоходовРасходов_Key": "Edm.Guid",
+    "СчетУчетаРасчетовСКонтрагентомВал_Key": "Edm.Guid",
+    "СтатьяПрочихДоходовРасходовВал_Key": "Edm.Guid",
+    "ПодразделениеОрганизации_Key": "Edm.Guid",
+    "НДСПредъявленКВычету": "Edm.Boolean",
+    "Ответственный_Key": "Edm.Guid",
+    "Комментарий": "Edm.String",
+    "РучнаяКорректировка": "Edm.Boolean",
+    "УдалитьСчетУчетаРасходов_Key": "Edm.Guid",
+    "НДСВключенВСтоимость": "Edm.Boolean",
+    "СпособЗачетаАвансов": "Edm.String",
+    "Разделы": "Collection(StandardODATA.Document_ГТДИмпорт_Разделы_RowType)",
+    "Товары": "Collection(StandardODATA.Document_ГТДИмпорт_Товары_RowType)",
+    "ЗачетАвансов": "Collection(StandardODATA.Document_ГТДИмпорт_ЗачетАвансов_RowType)"
+   },
+   "navigations": [
+    "Организация",
+    "Контрагент",
+    "ДоговорКонтрагента",
+    "ДоговорКонтрагентаРегл",
+    "ВалютаДокумента",
+    "НомерГТД",
+    "СчетУчетаРасчетовСКонтрагентом",
+    "СтатьяПрочихДоходовРасходов",
+    "СчетУчетаРасчетовСКонтрагентомВал",
+    "СтатьяПрочихДоходовРасходовВал",
+    "ПодразделениеОрганизации",
+    "Ответственный",
+    "УдалитьСчетУчетаРасходов"
+   ]
+  },
+  "Document_ОперацияБух": {
+   "key": [
+    "Ref_Key"
+   ],
+   "properties": {
+    "Ref_Key": "Edm.Guid",
+    "DataVersion": "Edm.String",
+    "Number": "Edm.String",
+    "Date": "Edm.DateTime",
+    "DeletionMark": "Edm.Boolean",
+    "Posted": "Edm.Boolean",
+    "Организация_Key": "Edm.Guid",
+    "СуммаОперации": "Edm.Double",
+    "Содержание": "Edm.String",
+    "СпособЗаполнения": "Edm.String",
+    "СторнируемыйДокумент": "Edm.String",
+    "Ответственный_Key": "Edm.Guid",
+    "Комментарий": "Edm.String",
+    "ТиповаяОперация_Key": "Edm.Guid",
+    "МежотчетныйПериод": "Edm.Boolean",
+    "ТаблицаРегистровСведений": "Collection(StandardODATA.Document_ОперацияБух_ТаблицаРегистровСведений_RowType)",
+    "ТаблицаРегистровНакопления": "Collection(StandardODATA.Document_ОперацияБух_ТаблицаРегистровНакопления_RowType)",
+    "СпособЗаполнения_Type": "Edm.String",
+    "СторнируемыйДокумент_Type": "Edm.String"
+   },
+   "navigations": [
+    "Организация",
+    "Ответственный",
+    "ТиповаяОперация"
+   ]
   }
  }
 }
