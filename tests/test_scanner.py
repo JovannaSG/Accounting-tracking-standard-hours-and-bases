@@ -142,7 +142,7 @@ def test_build_scan_diff_lists_only_unmapped_entities(clean_db):
         {"url": "https://donor/1"},
         {
             mapped_entity: {"properties": {"Ref_Key"}},
-            novel: {"properties": {"Ref_Key", "Responsible"}},
+            novel: {"properties": {"Ref_Key", "Ответственный"}},
         },
     )
 
@@ -159,7 +159,7 @@ def test_prefill_key_fails_latin_check_so_admin_must_choose():
     """
     diff = ui._build_scan_diff(
         {"url": "https://donor/1"},
-        {"Document_Увольнение": {"properties": {"Ref_Key", "Author"}}},
+        {"Document_Увольнение": {"properties": {"Ref_Key", "Ответственный"}}},
     )
     assert diff, "сущность должна попасть в diff"
     candidate = diff[0]
@@ -178,6 +178,74 @@ def test_entity_label_strips_1c_prefixes():
     assert ui._entity_label("Document_A") == "A"
     assert ui._entity_label("Document_") == "Document_"
     assert ui._entity_label("БезПрефикса") == "БезПрефикса"
+
+
+def test_build_scan_diff_only_proposes_document_entities(clean_db):
+    """Diff предлагает только Document_* без row-типов (*_RecordType).
+
+    Регрессия на выгрузку 1393 сущностей: каталоги, регистры, бизнес-процессы
+    и ряды регистров не являются документами с нормами и в кандидаты не
+    попадают (Track 2, denylist по Document_*). Табличные части (например,
+    Document_ГТДИмпорт_Товары) с тем же именем нельзя отличить по одному
+    имени — их отсекает пересечение с EntitySet (см. следующий тест).
+    """
+    diff = ui._build_scan_diff(
+        {"url": "https://donor/1"},
+        {
+            "Document_Новый": {"properties": {"Ref_Key"}},
+            "Catalog_Товары": {"properties": {"Ref_Key"}},
+            "InformationRegister_Остатки": {"properties": {"Ref_Key"}},
+            "AccumulationRegister_Обороты": {"properties": {"Ref_Key"}},
+            "AccumulationRegister_Обороты_RecordType": {"properties": {"Ref_Key"}},
+            "Document_Ложный_RecordType": {"properties": {"Ref_Key"}},
+        },
+    )
+    entities = {c["entity"] for c in diff}
+    assert entities == {"Document_Новый"}, f"в diff осталось лишнее: {entities}"
+
+
+def test_build_scan_diff_intersects_with_entity_sets(clean_db):
+    """Пересечение с сущностями публикации отсекает row-типы табличных частей.
+
+    Без entity_sets (fallback) остаётся любой Document_*, не оканчивающийся
+    на _RecordType; с entity_sets — только реальные наборы OData.
+    """
+    props = {
+        "Document_Акт": {"properties": {"Ref_Key"}},
+        "Document_ГТДИмпорт_Разделы": {"properties": {"Ref_Key"}},
+    }
+    entity_sets = {"Document_Акт": "StandardODATA.Document_Акт"}
+
+    with_sets = ui._build_scan_diff({"url": "https://donor/1"}, props, entity_sets)
+    assert {c["entity"] for c in with_sets} == {"Document_Акт"}
+
+    fallback = ui._build_scan_diff({"url": "https://donor/1"}, props)
+    assert {c["entity"] for c in fallback} == {
+        "Document_Акт", "Document_ГТДИмпорт_Разделы",
+    }
+
+
+def test_scan_flags_read_russian_properties(clean_db):
+    """Флаги has_* определяются по русским именам реквизитов 1С:Фреш.
+
+    «Ответственный_Key» и «ВидОперации» — как в реальном $metadata;
+    has_author_key удалён («Автор» в 1С:Фреш не публикуется).
+    """
+    diff = ui._build_scan_diff(
+        {"url": "https://donor/1"},
+        {
+            "Document_СОтветственным": {
+                "properties": {"Ответственный_Key", "ВидОперации"},
+            },
+            "Document_БезРеквизитов": {"properties": {"Ref_Key", "Комментарий"}},
+        },
+    )
+    by_entity = {c["entity"]: c for c in diff}
+    assert by_entity["Document_СОтветственным"]["has_responsible_key"] is True
+    assert by_entity["Document_СОтветственным"]["has_operation_type"] is True
+    assert by_entity["Document_БезРеквизитов"]["has_responsible_key"] is False
+    assert by_entity["Document_БезРеквизитов"]["has_operation_type"] is False
+    assert "has_author_key" not in by_entity["Document_СОтветственным"]
 
 
 # ============================ КЛЮЧ doc_type =================================

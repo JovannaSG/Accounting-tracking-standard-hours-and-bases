@@ -33,6 +33,7 @@ DEFAULT_NORMS_HOURS: dict[str, float] = {
     # Норм в ТЗ нет — выставляются администратором
     "writeoff_materials_from_use": 0.0,
     "return_customer": 0.0,
+    "customs_declaration": 0.0,
     "payroll_accrual": 0.11,
     # Доп. варианты по табличным нормам из документа
     "bank_incoming_manual": 0.10,
@@ -49,6 +50,7 @@ DEFAULT_NORMS_HOURS: dict[str, float] = {
 DEFAULT_NORMS_COMMENTS: dict[str, str] = {
     "writeoff_materials_from_use": "Норма не задана в ТЗ — укажите вручную",
     "return_customer": "Норма не задана в ТЗ — укажите вручную",
+    "customs_declaration": "Норма не задана в ТЗ — укажите вручную",
 }
 
 

@@ -213,6 +213,12 @@
     "entity": "Document_ВозвратТоваровОтПокупателя",
     "unit": "документ"
   },
+  "customs_declaration": {
+    "category": "Первичные документы",
+    "title": "ГТД (импорт)",
+    "entity": "Document_ГТДИмпорт",
+    "unit": "документ"
+  },
   "payroll_accrual": {
     "entity": "Document_НачислениеЗарплаты",
     "title": "Начисление зарплаты",

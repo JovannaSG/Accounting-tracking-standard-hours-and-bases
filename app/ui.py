@@ -914,7 +914,7 @@ def render_norms_tab():
 
 
 # Ключ нового вида документа: начинается с латинской буквы, дальше латиница,
-# цифры и подчёркивание. Проверка на практике: все 30 ключей из
+# цифры и подчёркивание. Проверка на практике: все 31 ключ из
 # core/doc_types.json этому правилу удовлетворяют.
 _DOC_TYPE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
@@ -1002,10 +1002,11 @@ def _render_registry_scanner() -> None:
                     donor.get("password") or "",
                 )
                 props = client.fetch_metadata_entity_properties()
+                entity_sets = client.fetch_metadata_entity_sets()
             except Exception as e:  # noqa: BLE001 - показываем как есть
                 st.error(f"Скан не выполнен: {e}")
                 st.rerun()
-        st.session_state["scan_diff"] = _build_scan_diff(donor, props)
+        st.session_state["scan_diff"] = _build_scan_diff(donor, props, entity_sets)
         st.rerun()
 
     rows = st.session_state.get("scan_diff")
@@ -1093,7 +1094,6 @@ def _render_registry_scanner() -> None:
                 ref_base=donor_url,
                 variant_rules_json=vjson,
                 has_responsible_key=bool(record.get("has_responsible_key")),
-                has_author_key=bool(record.get("has_author_key")),
                 has_operation_type=bool(record.get("has_operation_type")),
             )
         except ValueError as e:
@@ -1159,8 +1159,18 @@ def _render_manifest_snippets(snippets: dict[str, dict]) -> None:
     st.code(json.dumps(snippets, ensure_ascii=False, indent=2), language="json")
 
 
-def _build_scan_diff(donor: dict, props: dict) -> list[dict]:
+def _build_scan_diff(
+    donor: dict, props: dict, entity_sets: dict | None = None
+) -> list[dict]:
     """Сущности донора, которых нет в манифесте core/doc_types.json.
+
+    Предлагаются ТОЛЬКО документы:
+      - имя начинается с ``Document_`` (Track 2: denylist к Document_*);
+      - не оканчивается на ``_RecordType`` (ряд-типы регистров и табличных
+        частей не являются самостоятельными наборами);
+      - при переданном ``entity_sets`` входит в состав публикации
+        (пересечение с наборами OData отсекает row-типы табличных частей,
+        например ``Document_ГТДИмпорт_Товары``).
 
     doc_type здесь НЕ выводится из имени сущности. Связь entity -> doc_type
     одно-ко-многим: один entity обслуживает несколько ключей (например,
@@ -1185,10 +1195,19 @@ def _build_scan_diff(donor: dict, props: dict) -> list[dict]:
         if spec and spec.get("entity")
     }
     known = {n["doc_type"] for n in db.list_norms(active_only=False)}
+    sets = set(entity_sets or {})
 
     candidates = []
     for entity_name in sorted(props or {}):
-        if not entity_name or entity_name in mapped_entities:
+        if not entity_name:
+            continue
+        if not entity_name.startswith("Document_"):
+            continue
+        if entity_name.endswith("_RecordType"):
+            continue
+        if sets and entity_name not in sets:
+            continue
+        if entity_name in mapped_entities:
             continue
         if entity_name in known:
             continue
@@ -1202,9 +1221,8 @@ def _build_scan_diff(donor: dict, props: dict) -> list[dict]:
             "unit": "документ",
             "variant_rules_json": "{}",
             "ref_base": donor.get("url") or "",
-            "has_responsible_key": _has_prop(properties, "Responsible"),
-            "has_author_key": _has_prop(properties, "Author"),
-            "has_operation_type": _has_prop(properties, "OperationType"),
+            "has_responsible_key": _has_prop(properties, "Ответственный"),
+            "has_operation_type": _has_prop(properties, "ВидОперации"),
         })
     return candidates
 

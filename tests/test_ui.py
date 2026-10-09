@@ -1004,7 +1004,7 @@ def test_donor_change_discards_stale_diff(clean_db, scanner_enabled):
         {"doc_type": "stale_from_b", "title": "Чужой", "entity": "Document_X",
          "category": "К", "unit": "документ", "variant_rules_json": "{}",
          "ref_base": "https://donor_b.example/odata",
-         "has_responsible_key": False, "has_author_key": False,
+         "has_responsible_key": False,
          "has_operation_type": False},
     ]
 
@@ -1055,18 +1055,18 @@ def test_save_loop_validates_key_and_json_per_row(clean_db, scanner_enabled):
         {"doc_type": "brand_new_key", "title": "Новый вид", "entity": "Document_Новый",
          "category": "К", "unit": "документ", "variant_rules_json": "{}",
          "ref_base": donor["url"], "has_responsible_key": False,
-         "has_author_key": False, "has_operation_type": False},
+         "has_operation_type": False},
         # 2) кириллический ключ: ошибка валидации, до JSON даже не доходит
         {"doc_type": "Document_Увольнение", "title": "Увольнение",
          "entity": "Document_Увольнение", "category": "К", "unit": "документ",
          "variant_rules_json": "{}", "ref_base": donor["url"],
-         "has_responsible_key": False, "has_author_key": False,
+         "has_responsible_key": False,
          "has_operation_type": False},
         # 3) битый JSON
         {"doc_type": "bad_json_key", "title": "Битый", "entity": "Document_Битый",
          "category": "К", "unit": "документ", "variant_rules_json": "{oops",
          "ref_base": donor["url"], "has_responsible_key": False,
-         "has_author_key": False, "has_operation_type": False},
+         "has_operation_type": False},
     ]
     # Прогон после записи в session_state: без него кнопка «Добавить» ещё
     # не отрисована, потому что diff появляется только на следующем прогоне.
@@ -1116,7 +1116,7 @@ def test_save_loop_never_overwrites_existing_norm(clean_db, scanner_enabled):
         {"doc_type": "guarded", "title": "Заголовок сканера",
          "entity": "Document_Guard", "category": "Чужая",
          "unit": "документ", "variant_rules_json": "{}", "ref_base": donor["url"],
-         "has_responsible_key": False, "has_author_key": False,
+         "has_responsible_key": False,
          "has_operation_type": False},
     ]
     at.run()

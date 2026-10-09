@@ -1001,7 +1001,7 @@ def test_init_db_preserves_legacy_norms_data(monkeypatch):
     db.init_db()
 
     added = ("is_discovered", "discovered_at", "has_responsible_key",
-             "has_author_key", "has_operation_type", "variant_rules_json",
+             "has_operation_type", "variant_rules_json",
              "ref_base")
     snap = _schema_snapshot(path)["norms"]
     for column in added:
@@ -1016,6 +1016,42 @@ def test_init_db_preserves_legacy_norms_data(monkeypatch):
     assert norm["ref_base"] is None
 
 
+def test_init_db_drops_has_author_key_column(monkeypatch):
+    """has_author_key удаляется из старых баз (SQLite >= 3.35)."""
+    tmp = tempfile.mkdtemp(prefix="norms_author_")
+    path = os.path.join(tmp, "legacy.db")
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE norms ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "doc_type TEXT NOT NULL, category TEXT NOT NULL, title TEXT NOT NULL, "
+        "entity TEXT NOT NULL, unit TEXT, norm_min REAL NOT NULL, "
+        "norm_hours REAL NOT NULL, coeff REAL NOT NULL DEFAULT 1.00, "
+        "sno TEXT, date_from TEXT, date_to TEXT, comment TEXT, "
+        "sort_order INTEGER NOT NULL DEFAULT 0, "
+        "active INTEGER NOT NULL DEFAULT 1, "
+        "has_author_key INTEGER NOT NULL DEFAULT 0, UNIQUE (doc_type))"
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(db, "_DB_PATH", path)
+    db.init_db()
+
+    snap = _schema_snapshot(path)["norms"]
+    if sqlite3.sqlite_version_info >= (3, 35, 0):
+        assert "has_author_key" not in snap, (
+            "колонка has_author_key не удалена миграцией"
+        )
+    else:
+        # На SQLite без DROP COLUMN колонка остаётся, но ни кодом, ни
+        # проекцией не используется.
+        assert "has_author_key" in snap
+
+    norm = db.get_norm(doc_type="bank_incoming")
+    assert norm is None or "has_author_key" not in (norm or {})
+
+
 def test_norm_row_projection_exposes_discovery_columns(clean_db):
     """get_norm/list_norms отдают все столбцы проекции согласованно.
 
@@ -1026,7 +1062,6 @@ def test_norm_row_projection_exposes_discovery_columns(clean_db):
     db.insert_discovered_norm(
         doc_type="projection_check", category="К", title="Проверка",
         entity="Document_Проверка", ref_base="https://donor/1",
-        has_author_key=True,
     )
     from_db = db.get_norm(doc_type="projection_check")
     from_list = next(
@@ -1043,7 +1078,6 @@ def test_norm_row_projection_exposes_discovery_columns(clean_db):
     # Ключевые значения не сместились на соседние столбцы.
     assert from_db["title"] == "Проверка"
     assert from_db["ref_base"] == "https://donor/1"
-    assert from_db["has_author_key"] is True
     assert from_db["has_responsible_key"] is False
     assert from_db["is_discovered"] is True
     assert from_db["active"] is True
@@ -1066,7 +1100,6 @@ def test_insert_discovered_norm_creates_net_new(clean_db):
     assert norm["ref_base"] == "https://donor/a/1"
     assert norm["is_discovered"] is True
     assert norm["has_responsible_key"] is True
-    assert norm["has_author_key"] is False
     assert norm["has_operation_type"] is True
     # Нет нормы -> 0.0: find_missing_norms() считает нулевую норму «не заданной».
     assert norm["norm_hours"] == 0.0

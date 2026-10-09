@@ -266,8 +266,13 @@ def init_db():
         cursor.execute("ALTER TABLE norms ADD COLUMN discovered_at TEXT")
     if "has_responsible_key" not in existing_norms:
         cursor.execute("ALTER TABLE norms ADD COLUMN has_responsible_key INTEGER NOT NULL DEFAULT 0")
-    if "has_author_key" not in existing_norms:
-        cursor.execute("ALTER TABLE norms ADD COLUMN has_author_key INTEGER NOT NULL DEFAULT 0")
+    # has_author_key удалён с версии 0-4: «Автор» в 1С:Фреш OData не
+    # публикуется, флаг всегда был False. Из старых баз колонка убирается
+    # физически (SQLite >= 3.35); на более старой версии остаётся, но
+    # ни кодом, ни проекцией не читается (прецедент — bases.group).
+    if "has_author_key" in existing_norms:
+        if sqlite3.sqlite_version_info >= (3, 35, 0):
+            cursor.execute("ALTER TABLE norms DROP COLUMN has_author_key")
     if "has_operation_type" not in existing_norms:
         cursor.execute("ALTER TABLE norms ADD COLUMN has_operation_type INTEGER NOT NULL DEFAULT 0")
     if "variant_rules_json" not in existing_norms:
@@ -1000,14 +1005,14 @@ _NORMS_COLUMNS: tuple[str, ...] = (
     "comment", "sort_order", "active",
     # Столбцы обнаружения реестра (аддитивные миграции ниже в init_db())
     "ref_base", "is_discovered", "discovered_at",
-    "has_responsible_key", "has_author_key", "has_operation_type",
+    "has_responsible_key", "has_operation_type",
     "variant_rules_json",
 )
 
 # Признаки обнаружения: приводятся к bool при чтении.
 _NORMS_BOOL_COLUMNS: tuple[str, ...] = (
     "active", "is_discovered",
-    "has_responsible_key", "has_author_key", "has_operation_type",
+    "has_responsible_key", "has_operation_type",
 )
 
 
@@ -1131,7 +1136,6 @@ def insert_discovered_norm(
     discovered_at: str | None = None,
     variant_rules_json: str = "{}",
     has_responsible_key: bool = False,
-    has_author_key: bool = False,
     has_operation_type: bool = False,
 ) -> bool:
     """
@@ -1180,9 +1184,9 @@ def insert_discovered_norm(
         "norm_min, norm_hours, coeff, sno, date_from, date_to, "
         "comment, sort_order, active, "
         "ref_base, is_discovered, discovered_at, "
-        "has_responsible_key, has_author_key, has_operation_type, "
+        "has_responsible_key, has_operation_type, "
         "variant_rules_json"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(doc_type) DO NOTHING",
         (
             key,
@@ -1203,7 +1207,6 @@ def insert_discovered_norm(
             1,
             discovered_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
             int(bool(has_responsible_key)),
-            int(bool(has_author_key)),
             int(bool(has_operation_type)),
             vjson,
         ),
