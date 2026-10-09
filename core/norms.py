@@ -33,7 +33,7 @@ DEFAULT_NORMS_HOURS: dict[str, float] = {
     # Норм в ТЗ нет — выставляются администратором
     "writeoff_materials_from_use": 0.0,
     "return_customer": 0.0,
-    "payroll_accrual": 0.20,
+    "payroll_accrual": 0.11,
     # Доп. варианты по табличным нормам из документа
     "bank_incoming_manual": 0.10,
     "bank_outgoing_manual": 0.10,
