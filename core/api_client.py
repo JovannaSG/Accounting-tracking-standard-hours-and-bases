@@ -3,12 +3,15 @@ import json
 import os
 import sys
 import threading
+import time
 import concurrent.futures
-from typing import Any
+from typing import Any, Callable
 
 import requests
 from requests.auth import HTTPBasicAuth
 from requests.adapters import HTTPAdapter
+from requests.exceptions import (HTTPError, RequestException, RetryError)
+from urllib3.util.retry import Retry
 
 if __package__ in (None, ""):
     sys.path.insert(
@@ -26,6 +29,9 @@ _SCHEMA_PATH = os.path.join(
 
 _schema_lock = threading.Lock()
 _schema_cache: dict[str, Any] | None = None
+
+# Транспорт: повторы 1С:Фреш (см. OneCClient.__init__). 1,2,4,8,... секунд.
+_DEFAULT_RETRY_TOTAL = 5
 
 
 def _load_schema() -> dict[str, Any]:
@@ -48,9 +54,11 @@ class OneCClient:
 
     Один экземпляр = одна клиентская база (1С:Фреш). Предоставляет:
 
-    - пагинацию OData через ``_paginate``;
+    - пагинацию OData через ``_paginate_pages`` (генератор, nextLink/$skip);
+    - экспоненциальный backoff для 429/5xx через urllib3.Retry;
     - кэш «GUID -> Наименование» для справочников (клиентский JOIN);
-    - целочисленную выгрузку документов за период (``fetch_documents``);
+    - выгрузку документов за период лениво (``fetch_documents_iter``) и
+      списком (``fetch_documents``, обратная совместимость);
     - диагностику состава публикации (``fetch_metadata_entity_sets``).
     """
 
@@ -60,7 +68,21 @@ class OneCClient:
         self.session.auth = HTTPBasicAuth(username, password)
         self.session.headers.update({"Accept": "application/json"})
 
-        adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+        retries = Retry(
+            total=_DEFAULT_RETRY_TOTAL,
+            connect=_DEFAULT_RETRY_TOTAL,
+            read=_DEFAULT_RETRY_TOTAL,
+            status=_DEFAULT_RETRY_TOTAL,
+            backoff_factor=1.0,      # экспонента 1, 2, 4, 8, 16 c
+            backoff_max=32.0,
+            backoff_jitter=1.0,      # рассинхронизация повторов (no thundering herd)
+            retry_after_max=30.0,    # кап для Retry-After от 1С:Фреш
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET",),
+        )
+        adapter = HTTPAdapter(
+            pool_connections=20, pool_maxsize=20, max_retries=retries
+        )
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
 
@@ -70,38 +92,125 @@ class OneCClient:
         self._organizations: dict[str, dict[str, str]] = {}
         self._catalogs_loaded = False
         self._cache_lock = threading.Lock()
+        # Деградировавшие на минимальный $select сущности (silent-400 фолбэк).
+        # Только запись: аудит читает её и помечает выгрузку как data-poor.
+        self._degraded_entities: set[str] = set()
 
-    def _paginate(self, endpoint: str, params: dict[str, Any]) -> list[dict]:
-        """
-        Загружает все страницы OData (фиксируя $skip по длине ответа)
-        """
+    @staticmethod
+    def _is_select_error(message: str) -> bool:
+        """Признак 400/500 — фолбэк на минимальный $select (как было раньше).
 
-        all_records: list[dict] = []
+        400 возникает из-за несовместимого $select; исключённый 500 обычно
+        был следствием кривого кодирования $filter (исправлен через quote) и
+        теперь в основном уходит в Retry, но значение из бэк-офиса 1С тоже
+        остаётся поводом для деградации (обратная совместимость).
+        """
+        return "400" in message or "500" in message
+
+    def _request_page(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Один GET страницы OData с маппингом ошибок в ValueError.
+
+        Повторы 429/5xx выполняет urllib3.Retry на уровне сессии; сюда
+        приходит либо успешный ответ, либо ошибка ПОСЛЕ исчерпания повторов.
+        """
+        try:
+            response = self.session.get(endpoint, params=params, timeout=30)
+            response.raise_for_status()
+            return response.json()
+        except RetryError as e:
+            raise ValueError(
+                f"1С не ответила после {_DEFAULT_RETRY_TOTAL} повторов: {e}"
+            ) from e
+        except HTTPError as e:
+            raise ValueError(self._friendly_http_error(e)) from e
+        except RequestException as e:
+            raise ValueError(f"Не удалось соединиться с 1C: {e}") from e
+
+    @staticmethod
+    def _page_top(endpoint: str, params: dict[str, Any]) -> int:
+        """Размер страницы из URL ($top) либо из params, иначе 1000.
+
+        1С:Фреш кладёт $top в URL (в т.ч. в @odata.nextLink); справочники
+        передают его в params. Используется для критерия «страница короче
+        $top = последняя».
+        """
+        from urllib.parse import parse_qs, urlparse
+
+        raw = None
+        query = urlparse(endpoint).query
+        if query:
+            raw = parse_qs(query).get(r"$top")
+        if not raw:
+            value = (params or {}).get(r"$top")
+            raw = (
+                value if isinstance(value, list)
+                else ([str(value)] if value else None)
+            )
+        if not raw:
+            return 1000
+        try:
+            return int(raw[0])
+        except (TypeError, ValueError):
+            return 1000
+
+    def _paginate_pages(
+        self,
+        endpoint: str,
+        params: dict[str, Any],
+        pause: float = 0.0,
+        on_page: Callable[[], None] | None = None,
+    ):
+        """
+        Генератор страниц OData.
+
+        Следует ``@odata.nextLink``, если 1С его вернула; иначе продолжает
+        инкрементальный ``$skip`` (поведение, проверенное на доноре). Постоянная
+        память независимо от объёма: страница обрабатывается и отпускается.
+
+        ``pause > 0`` — жёсткая пауза между запросами (токен-рейт для 1С:Фреш;
+        отчёт использует 0.0, аудит — 0.2). ``on_page`` — хук после каждой
+        успешной страницы (аудит считает страницы для checkpoint'а).
+        """
         params = dict(params or {})
+        first = True
         while True:
-            try:
-                response = self.session.get(
-                    endpoint,
-                    params=params,
-                    timeout=30
-                )
-                response.raise_for_status()
-                data = response.json()
-            except requests.exceptions.HTTPError as e:
-                raise ValueError(self._friendly_http_error(e)) from e
-            except requests.exceptions.RequestException as e:
-                raise ValueError(f"Не удалось соединиться с 1C: {e}") from e
+            if not first and pause > 0:
+                time.sleep(pause)
+            data = self._request_page(endpoint, params)
+            first = False
+            yield data
+            if on_page is not None:
+                on_page()
 
-            chunk = data.get('value', [])
+            chunk = data.get("value", [])
             if not chunk:
-                break
-
-            all_records.extend(chunk)
+                return
+            next_link = data.get("@odata.nextLink")
+            if next_link:
+                endpoint = next_link
+                params = {}
+                continue
             params["$skip"] = params.get("$skip", 0) + len(chunk)
-            if len(chunk) < int(params.get("$top", 1000)):
-                break
+            if len(chunk) < self._page_top(endpoint, params):
+                return
 
-        return all_records
+    def _paginate(
+        self,
+        endpoint: str,
+        params: dict[str, Any],
+        pause: float = 0.0,
+    ) -> list[dict]:
+        """
+        Загружает все страницы OData списком записей (обёртка над
+        ``_paginate_pages`` для обратной совместимости: справочники,
+        старые вызовы).
+        """
+
+        return [
+            rec
+            for page in self._paginate_pages(endpoint, params, pause=pause)
+            for rec in page.get("value", [])
+        ]
 
     @staticmethod
     def _friendly_http_error(error: requests.exceptions.HTTPError) -> str:
@@ -210,6 +319,92 @@ class OneCClient:
             return set()
         return set(ent.get("properties") or {})
 
+    def _documents_request(
+        self,
+        entity: str,
+        period_start: str,
+        period_end: str,
+        fields: list[str],
+        page_size: int,
+    ) -> tuple[str, dict[str, Any]]:
+        """Собирает endpoint + params запроса документов сущности за период.
+
+        Фильтр по дате: ``Date ge datetime'..' and Date le datetime'..'``
+        (граница конца дня приклеивается как ``T23:59:59``). Кодирование
+        через urllib.parse.quote: requests по умолчанию кодирует пробелы
+        как '+', а 1С такой фильтр не парсит (500).
+        """
+        from urllib.parse import quote
+
+        period_start_safe = self._start_of_day(period_start)
+        period_end_safe = self._end_of_day(period_end)
+        ffilter = (
+            f"Date ge datetime'{period_start_safe}' "
+            f"and Date le datetime'{period_end_safe}'"
+        )
+        select_query = quote(",".join(fields), safe="")
+        filter_query = quote(ffilter, safe="")
+        endpoint = (
+            f"{self.base_url}/odata/standard.odata/{entity}"
+            f"?{r'$format'}=json&{r'$select'}={select_query}"
+            f"&{r'$filter'}={filter_query}&{r'$top'}={page_size}"
+        )
+        return endpoint, {r"$skip": 0}
+
+    def fetch_documents_iter(
+        self,
+        entity: str,
+        period_start: str,
+        period_end: str,
+        select: list[str] | None = None,
+        pause: float = 0.0,
+        page_size: int = 1000,
+        on_page: Callable[[], None] | None = None,
+    ):
+        """Генератор документов сущности за период (ленивая выгрузка).
+
+        Потребитель (аудит) обрабатывает каждую строку и отпускает — память
+        не растёт с объёмом данных. Первый запрос пробует полный ``$select``;
+        если 1С отвечает 400/500 (несовместимость полей), выполняется повтор
+        с минимальным набором из трёх полей, а сущность фиксируется в
+        ``self._degraded_entities`` — аудит помечает такую выгрузку как
+        data-poor. Если ошибка приходит ПОСЛЕ первого успешного запроса —
+        она пробрасывается напрямую (иначе строки задвоились бы).
+        """
+        if select is None:
+            available = self.entity_properties(entity)
+            fields = (
+                [f for f in self._COMMON_FIELDS if f in available]
+                if available
+                else list(self._COMMON_FIELDS)
+            )
+        else:
+            fields = list(select)
+
+        endpoint, params = self._documents_request(
+            entity, period_start, period_end, fields, page_size
+        )
+        yielded = False
+        try:
+            for page in self._paginate_pages(
+                endpoint, params, pause=pause, on_page=on_page
+            ):
+                for rec in page.get("value", []):
+                    yielded = True
+                    yield rec
+        except ValueError as e:
+            if yielded or not self._is_select_error(str(e)):
+                raise
+            self._degraded_entities.add(entity)
+            fields = list(self._COMMON_FIELDS[:3])
+            endpoint, params = self._documents_request(
+                entity, period_start, period_end, fields, page_size
+            )
+            for page in self._paginate_pages(
+                endpoint, params, pause=pause, on_page=on_page
+            ):
+                yield from page.get("value", [])
+
     def fetch_documents(
         self,
         entity: str,
@@ -218,54 +413,16 @@ class OneCClient:
         select: list[str] | None = None,
     ) -> list[dict]:
         """
-        Выгружает документы сущности за период.
+        Выгружает документы сущности за период списком.
 
-        Фильтр по дате строится как ``Date ge datetime'..' and Date le datetime'..'``
-        (граница конца дня приклеивается как ``T23:59:59``). Если часть полей
-        недоступна для сущности (400 Bad Request) — повторный запрос с
-        минимальным набором полей.
+        Обёртка над ``fetch_documents_iter``: интерфейс и поведение для
+        отчёта (``core.fetch.fetch_documents``) и старых вызовов не меняются.
+        Если часть полей недоступна для сущности (400 Bad Request) — повторный
+        запрос с минимальным набором полей (фолбэк ниже в ``_iter``).
         """
-        if select is None:
-            available = self.entity_properties(entity)
-            select = (
-                [f for f in self._COMMON_FIELDS if f in available]
-                if available
-                else list(self._COMMON_FIELDS)
-            )
-        period_start_safe = self._start_of_day(period_start)
-        period_end_safe = self._end_of_day(period_end)
-        ffilter = (
-            f"Date ge datetime'{period_start_safe}' "
-            f"and Date le datetime'{period_end_safe}'"
+        return list(
+            self.fetch_documents_iter(entity, period_start, period_end, select=select)
         )
-        # Кодируем $filter через urllib.parse.quote: requests по умолчанию
-        # кодирует пробелы как '+', а 1С такой фильтр не парсит (500).
-        from urllib.parse import quote
-        fields = select or list(self._COMMON_FIELDS)
-        select_query = quote(",".join(fields), safe="")
-        filter_query = quote(ffilter, safe="")
-        endpoint = (
-            f"{self.base_url}/odata/standard.odata/{entity}"
-            f"?{r'$format'}=json&{r'$select'}={select_query}"
-            f"&{r'$filter'}={filter_query}&{r'$top'}=1000"
-        )
-        params: dict[str, Any] = {r"$skip": 0}
-        try:
-            return self._paginate(endpoint, params)
-        except ValueError as e:
-            if "400" in str(e) or "500" in str(e):
-                if fields != self._COMMON_FIELDS[:3]:
-                    logger.warning(
-                        f"Поля {entity} недоступны, повторяем с минимальным набором..."
-                    )
-                    select_query = quote(",".join(self._COMMON_FIELDS[:3]), safe="")
-                    endpoint = (
-                        f"{self.base_url}/odata/standard.odata/{entity}"
-                        f"?{r'$format'}=json&{r'$select'}={select_query}"
-                        f"&{r'$filter'}={filter_query}&{r'$top'}=1000"
-                    )
-                    return self._paginate(endpoint, {r"$skip": 0})
-            raise
 
     def fetch_metadata_entity_sets(self) -> dict[str, str]:
         """Fetch and parse OData $metadata to extract entity sets.
