@@ -5,6 +5,7 @@ import pytest
 
 _APP_TEST_DIR = tempfile.mkdtemp(prefix="app_test_db_")
 _APP_TEST_DB = os.path.join(_APP_TEST_DIR, "app_test.db")
+_AUDIT_TEST_DB = os.path.join(_APP_TEST_DIR, "audit_test.db")
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -32,6 +33,9 @@ def pytest_configure(config):
     """
     os.environ["AUDIT_USERS"] = ""
     os.environ["AUDIT_DB_PATH"] = _APP_TEST_DB
+    # БД истории аудита тоже направляем во временный каталог, иначе прогон
+    # создал бы audit_history.db в корне проекта.
+    os.environ["AUDIT_HISTORY_DB"] = _AUDIT_TEST_DB
     # Настоящий users.json (если создан) не должен сеять пользователей в тестах:
     # указываем на несуществующий путь → load_users_config() вернёт {}.
     os.environ["AUDIT_USERS_CONFIG"] = os.path.join(_APP_TEST_DIR, "users.json")
@@ -44,9 +48,10 @@ def pytest_configure(config):
 
 def pytest_sessionfinish(session, exitstatus):
     """Убираем общий временный файл БД после прогона."""
-    db_path = os.environ.get("AUDIT_DB_PATH")
-    if db_path:
-        _remove_db_with_sidecars(db_path)
+    for env_var in ("AUDIT_DB_PATH", "AUDIT_HISTORY_DB"):
+        db_path = os.environ.get(env_var)
+        if db_path:
+            _remove_db_with_sidecars(db_path)
 
 
 @pytest.fixture(autouse=True)
@@ -56,6 +61,7 @@ def _clean_app_db():
     yield
     os.environ["AUDIT_USERS"] = ""
     _remove_db_with_sidecars(_APP_TEST_DB)
+    _remove_db_with_sidecars(_AUDIT_TEST_DB)
     from core import auth
 
     auth._LOGIN_FAILURES.clear()

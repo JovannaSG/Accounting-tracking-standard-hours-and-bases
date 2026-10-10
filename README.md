@@ -50,6 +50,7 @@ pip install -r requirements.txt
 | Переменная | Назначение | По умолчанию |
 |---|---|---|
 | `AUDIT_DB_PATH` | Путь к SQLite-БД приложения | `norm_hours.db` |
+| `AUDIT_HISTORY_DB` | Отдельная БД истории глубокого аудита (`audit_runs`/`audit_checkpoints`/`audit_gap_counts`) | `audit_history.db` |
 | `AUDIT_USERS_CONFIG` | Путь к `users.json` (роли + доступы к базам) | `users.json` |
 | `AUDIT_USERS` | Fallback-пользователи `логин:хэш,логин2:хэш2` (PBKDF2) | пусто (выкл.) |
 | `AUDIT_DB_SECRET_KEY` | Ключ шифрования паролей клиентских баз (Fernet, base64 32 байта) | пусто (пароли в открытом виде) |

@@ -914,6 +914,103 @@ def test_upsert_employee_idempotent_does_not_create_users(clean_db):
     linked = [u for u in db.list_users() if u.get("employee_full_name")]
     assert linked == []
 
+# ============================ ИСТОРИЯ АУДИТА ================================
+
+def test_init_audit_db_creates_tables_idempotent(monkeypatch):
+    """init_audit_db(): три таблицы, повторные вызовы не меняют схему."""
+    tmp = tempfile.mkdtemp(prefix="audit_db_")
+    path = os.path.join(tmp, "audit.db")
+    monkeypatch.setattr(db, "_AUDIT_DB_PATH", path)
+
+    db.init_audit_db()
+    before = _schema_snapshot(path)
+    assert {"audit_runs", "audit_checkpoints", "audit_gap_counts"} <= set(
+        before
+    ), f"ожидались все аудит-таблицы, есть: {sorted(before)}"
+
+    db.init_audit_db()
+    db.init_audit_db()
+    after = _schema_snapshot(path)
+    assert before == after, "init_audit_db() не идемпотентен"
+
+
+def test_audit_checkpoints_unique_per_chunk(monkeypatch):
+    """UNIQUE(base_url, entity_name, chunk_start, chunk_end) не даёт дублей."""
+    tmp = tempfile.mkdtemp(prefix="audit_uniq_")
+    path = os.path.join(tmp, "audit.db")
+    monkeypatch.setattr(db, "_AUDIT_DB_PATH", path)
+    db.init_audit_db()
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "INSERT INTO audit_checkpoints (base_url, entity_name, "
+            "chunk_start, chunk_end, status) VALUES (?, ?, ?, ?, ?)",
+            ("https://b.example/a/1", "Document_X",
+             "2026-01-01", "2026-01-31", "RUNNING"),
+        )
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO audit_checkpoints (base_url, entity_name, "
+                "chunk_start, chunk_end, status) VALUES (?, ?, ?, ?, ?)",
+                ("https://b.example/a/1", "Document_X",
+                 "2026-01-01", "2026-01-31", "COMPLETED"),
+            )
+    finally:
+        conn.close()
+
+
+def test_audit_gap_counts_unique_per_entity(monkeypatch):
+    tmp = tempfile.mkdtemp(prefix="audit_gap_uniq_")
+    path = os.path.join(tmp, "audit.db")
+    monkeypatch.setattr(db, "_AUDIT_DB_PATH", path)
+    db.init_audit_db()
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "INSERT INTO audit_gap_counts (base_url, entity_name, doc_count) "
+            "VALUES (?, ?, ?)",
+            ("https://b.example/a/1", "Document_X", 5),
+        )
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO audit_gap_counts (base_url, entity_name, doc_count) "
+                "VALUES (?, ?, ?)",
+                ("https://b.example/a/1", "Document_X", 7),
+            )
+    finally:
+        conn.close()
+
+
+def test_list_audit_runs_orders_by_id_desc(monkeypatch):
+    tmp = tempfile.mkdtemp(prefix="audit_runs_")
+    path = os.path.join(tmp, "audit.db")
+    monkeypatch.setattr(db, "_AUDIT_DB_PATH", path)
+    db.init_audit_db()
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "INSERT INTO audit_runs (base_url, period_start, period_end, "
+            "status) VALUES (?, ?, ?, ?)",
+            ("https://b.example/a/1", "2026-01-01", "2026-01-31", "COMPLETED"),
+        )
+        conn.execute(
+            "INSERT INTO audit_runs (base_url, period_start, period_end, "
+            "status) VALUES (?, ?, ?, ?)",
+            ("https://b.example/a/1", "2026-02-01", "2026-02-28", "RUNNING"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    runs = db.list_audit_runs(base_url="https://b.example/a/1")
+    assert [r["period_start"] for r in runs] == ["2026-02-01", "2026-01-01"]
+    assert runs[1]["status"] == "COMPLETED"
+
 # ============ СКИМ-ДРИФТ: init_db() МОЖЕТ ТОЛЬКО ДОБАВЛЯТЬ ================
 
 def _schema_snapshot(path: str) -> dict:

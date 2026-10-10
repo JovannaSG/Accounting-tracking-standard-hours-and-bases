@@ -15,6 +15,19 @@ _DB_PATH = os.environ.get(
     )
 )
 
+# Отдельная БД истории аудита (checkpoint-состояние, счётчики, ошибки).
+# Намеренно НЕ norm_hours.db: рабочая нагрузка аудита (частые апдейты
+# checkpoint'ов) не должна конкурировать за single-writer SQLite с
+# интерактивным Streamlit. Значение — переменная окружения AUDIT_HISTORY_DB,
+# по умолчанию audit_history.db рядом с основной БД (тот же docker-том).
+_AUDIT_DB_PATH = os.environ.get(
+    "AUDIT_HISTORY_DB",
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "audit_history.db"
+    )
+)
+
 # Путь к конфигу пользователей (роли + доступ к базам)
 # По умолчанию — users.json в корне проекта
 # Опционально переопределяется переменной окружения AUDIT_USERS_CONFIG
@@ -1551,3 +1564,178 @@ def _parse_json_list(raw) -> list:
         return [str(v) for v in parsed] if isinstance(parsed, list) else []
     except (TypeError, ValueError):
         return []
+
+
+# ======================= БД ИСТОРИИ АУДИТА ==============================
+# Отдельный файл (AUDIT_HISTORY_DB) и отдельная схема: audit_checkpoints
+# обновляется на каждый (entity × месяц), и эти частые записи не должны
+# конкурировать за single-writer с интерактивным Streamlit. Независимый
+# жизненный цикл (чистка/архив), чистая миграция на Postgres при росте.
+
+_AUDIT_RUNS_COLUMNS = (
+    "id", "base_url", "period_start", "period_end",
+    "include_unmapped", "status", "created_at", "finished_at",
+)
+
+# Проверяемое состояние выгрузки: idempotent/resume без дублей сети.
+_AUDIT_CHECKPOINTS_COLUMNS = (
+    "id", "run_id", "base_url", "entity_name",
+    "chunk_start", "chunk_end", "status",
+    "rows_processed", "sum_amount", "page_count",
+    "degraded", "expected_count", "count_available", "count_mismatch",
+    "error", "started_at", "finished_at",
+)
+
+_AUDIT_GAPS_COLUMNS = (
+    "id", "base_url", "entity_name", "run_id", "doc_count",
+    "count_available", "updated_at",
+)
+
+AUDIT_RUN_PENDING = "RUNNING"
+AUDIT_RUN_COMPLETED = "COMPLETED"
+AUDIT_RUN_FAILED = "FAILED"
+
+AUDIT_CP_PENDING = "PENDING"
+AUDIT_CP_RUNNING = "RUNNING"
+AUDIT_CP_COMPLETED = "COMPLETED"
+AUDIT_CP_FAILED = "FAILED"
+
+
+def init_audit_db() -> None:
+    """
+    Создаёт таблицы истории аудита, если их нет (идемпотентно, WAL).
+
+    Три таблицы:
+    - ``audit_runs`` — один прогон (база × период × {include_unmapped});
+    - ``audit_checkpoints`` — состояние каждого (entity × месяц): старый
+      комплекс COMPLETED не перечитывается при ``--resume``; RUNNING/FAILED
+      перезапускаются ровно с этого чанка;
+    - ``audit_gap_counts`` — счётчики нереестровых ``Document_*``
+      (только при ``--include-unmapped``).
+    """
+
+    conn = sqlite3.connect(_AUDIT_DB_PATH, timeout=30.0)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA synchronous=NORMAL;")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS audit_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            base_url TEXT NOT NULL,
+            period_start TEXT NOT NULL,
+            period_end TEXT NOT NULL,
+            include_unmapped INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            created_at TEXT,
+            finished_at TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS audit_checkpoints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER,
+            base_url TEXT NOT NULL,
+            entity_name TEXT NOT NULL,
+            chunk_start TEXT NOT NULL,
+            chunk_end TEXT NOT NULL,
+            status TEXT NOT NULL,
+            rows_processed INTEGER NOT NULL DEFAULT 0,
+            sum_amount REAL,
+            page_count INTEGER NOT NULL DEFAULT 0,
+            degraded INTEGER NOT NULL DEFAULT 0,
+            expected_count INTEGER,
+            count_available INTEGER NOT NULL DEFAULT 0,
+            count_mismatch INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            started_at TEXT,
+            finished_at TEXT,
+            UNIQUE (base_url, entity_name, chunk_start, chunk_end)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS audit_gap_counts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            base_url TEXT NOT NULL,
+            entity_name TEXT NOT NULL,
+            run_id INTEGER,
+            doc_count INTEGER NOT NULL DEFAULT 0,
+            count_available INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT,
+            UNIQUE (base_url, entity_name)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def _audit_conn() -> sqlite3.Connection:
+    """Соединение с БД истории аудита (таблицы гарантируются)."""
+
+    init_audit_db()
+    return sqlite3.connect(_AUDIT_DB_PATH, timeout=30.0)
+
+
+def _audit_row(row, columns: tuple[str, ...]) -> dict:
+    if row is None:
+        return {}
+    return dict(zip(columns, row))
+
+
+def list_audit_runs(base_url: str | None = None) -> list[dict]:
+    """Последние прогоны аудита (свежие сверху)."""
+
+    conn = _audit_conn()
+    try:
+        sql = "SELECT " + ", ".join(_AUDIT_RUNS_COLUMNS) + " FROM audit_runs"
+        params: list = []
+        if base_url:
+            sql += " WHERE base_url = ?"
+            params.append(base_url)
+        sql += " ORDER BY id DESC"
+        cursor = conn.execute(sql, params)
+        return [_audit_row(r, _AUDIT_RUNS_COLUMNS) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_audit_run(run_id: int) -> dict:
+    conn = _audit_conn()
+    try:
+        cursor = conn.execute(
+            "SELECT " + ", ".join(_AUDIT_RUNS_COLUMNS)
+            + " FROM audit_runs WHERE id = ?",
+            (run_id,),
+        )
+        return _audit_row(cursor.fetchone(), _AUDIT_RUNS_COLUMNS)
+    finally:
+        conn.close()
+
+
+def list_audit_checkpoints(run_id: int) -> list[dict]:
+    conn = _audit_conn()
+    try:
+        cursor = conn.execute(
+            "SELECT " + ", ".join(_AUDIT_CHECKPOINTS_COLUMNS)
+            + " FROM audit_checkpoints WHERE run_id = ?"
+            + " ORDER BY entity_name, chunk_start",
+            (run_id,),
+        )
+        return [_audit_row(r, _AUDIT_CHECKPOINTS_COLUMNS) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def list_audit_gap_counts(base_url: str) -> list[dict]:
+    conn = _audit_conn()
+    try:
+        cursor = conn.execute(
+            "SELECT " + ", ".join(_AUDIT_GAPS_COLUMNS)
+            + " FROM audit_gap_counts WHERE base_url = ?"
+            + " ORDER BY doc_count DESC, entity_name",
+            (base_url,),
+        )
+        return [_audit_row(r, _AUDIT_GAPS_COLUMNS) for r in cursor.fetchall()]
+    finally:
+        conn.close()

@@ -15,6 +15,9 @@ services:
       - "8503:8503"
     environment:
       AUDIT_DB_PATH: /data/norm_hours.db
+      # Отдельная БД истории глубокого аудита (checkpoint-состояние).
+      # В том же томе /data, чтобы резюм переживал перезапуск контейнера.
+      AUDIT_HISTORY_DB: /data/audit_history.db
       AUDIT_USERS_CONFIG: /data/users.json
       # Опциональный fallback-список «логин:хэш» (PBKDF2),
       # см. `python -m core.auth hash <пароль>`.
