@@ -271,8 +271,59 @@ def test_resume_skips_completed_chunks():
     assert second["chunks_completed"] == 0
     # резюм не делает ни одного сетевого запроса
     assert fake.calls == n_before
-    # Всего один checkpoint на этот (entity × chunk) навсегда
-    assert len(db.list_audit_checkpoints(first["run_id"])) == 1
+    # checkpoint переходит под текущий прогон: отчёт второго запуска не
+    # теряет ранее завершённый чанк (см. test_resume_report_keeps_skipped_chunks)
+    assert db.list_audit_checkpoints(first["run_id"]) == []
+    assert len(db.list_audit_checkpoints(second["run_id"])) == 1
+
+
+def test_resume_report_keeps_skipped_chunks(tmp_path):
+    """Резюм: отчёт второго прогона содержит и пропущенные (COMPLETED) чанки.
+
+    Регрессия: раньше SKIPPED не обновлял run_id checkpoint'а, поэтому
+    write_audit_report(second) и _count_mismatches видели только чанки,
+    выполненные во втором прогоне, — ранее завершённые (вместе с их
+    $count-расхождениями) пропадали из «Сводки»/«Проблем».
+    """
+    fake = _FakeData()
+    fake.set_entity("Document_A", rows=1, sum=10.0, count=5)  # mismatch
+    fake.set_entity("Document_B", rows=2, sum=20.0, count=2)  # ok
+    fc = _FakeClient(fake)
+
+    first = audit.run_audit(
+        _BASE, "2026-01-01", "2026-02-28",
+        client=fc.client, pause=0.0,
+        entities=["Document_A", "Document_B"],
+    )
+    assert first["chunks_total"] == 4
+    assert first["chunks_completed"] == 4
+    n_before = fake.calls
+
+    second = audit.run_audit(
+        _BASE, "2026-01-01", "2026-02-28",
+        client=fc.client, pause=0.0,
+        entities=["Document_A", "Document_B"],
+    )
+
+    # резюм: ни одного сетевого запроса, все чанки пропущены
+    assert second["chunks_skipped"] == 4
+    assert second["chunks_completed"] == 0
+    assert fake.calls == n_before
+
+    # отчёт второго прогона полон (4 чанка) и включает расхождения
+    checkpoints = db.list_audit_checkpoints(second["run_id"])
+    assert len(checkpoints) == 4
+    assert second["count_mismatches"] == 2  # Document_A за оба месяца
+
+    path = audit.write_audit_report(second, out_dir=str(tmp_path))
+    wb = openpyxl.load_workbook(path)
+    assert wb["Сводка"].max_row == 4 + 1
+    problems = wb["Проблемы"]
+    problem_entities = {
+        problems.cell(row=r, column=1).value
+        for r in range(2, problems.max_row + 1)
+    }
+    assert "Document_A" in problem_entities
 
 
 def test_restart_overrides_completed():
@@ -454,3 +505,42 @@ def test_resolve_base_by_name_and_url():
     assert by_url and by_url["id"] == base_id
     assert by_id and by_id["id"] == base_id
     assert audit._resolve_base("") is None
+
+
+def test_main_keyboard_interrupt_is_clean(monkeypatch, capsys):
+    base = db.insert_base(
+        "Аудит Прерван", "https://pause.example/a/1", "u", "p"
+    )
+    assert base is not None
+
+    def _interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(audit, "run_audit", _interrupt)
+    rc = audit.main([
+        "--base", "Аудит Прерван",
+        "--start", "2026-01-01", "--end", "2026-01-31",
+    ])
+    assert rc == 130
+    err = capsys.readouterr().err
+    assert "приостановлен" in err
+    assert "продолжит" in err
+
+
+def test_default_out_dir_prefers_data_volume(monkeypatch):
+    class _Path:
+        def __init__(self, path):
+            self.path = path
+
+        def is_dir(self):
+            return self.path == "/data"
+
+    monkeypatch.setattr(audit, "Path", _Path)
+    assert audit._default_out_dir() == "/data/exports"
+
+    class _NoData(_Path):
+        def is_dir(self):
+            return False
+
+    monkeypatch.setattr(audit, "Path", _NoData)
+    assert audit._default_out_dir() == "exports"

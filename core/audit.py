@@ -20,6 +20,7 @@ import sys
 import time
 from datetime import datetime
 from datetime import date
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -263,6 +264,22 @@ def _run_chunk(
     if (row is not None and not restart
             and db._audit_row(row, db._AUDIT_CHECKPOINTS_COLUMNS)["status"]
             == db.AUDIT_CP_COMPLETED):
+        # Чанк уже выполнен в прошлом прогоне. Перечитывать его не нужно, но
+        # его checkpoint должен «принадлежать» текущему run'у: иначе отчёт
+        # (list_audit_checkpoints по run_id) после резюма потерял бы все
+        # ранее завершённые чанки — вместе с их $count-расхождениями и
+        # деградацией. Это тот же приём, что и у audit_gap_counts.
+        conn = db._audit_conn()
+        try:
+            conn.execute(
+                "UPDATE audit_checkpoints SET run_id=? "
+                "WHERE base_url=? AND entity_name=? AND chunk_start=? "
+                "AND chunk_end=?",
+                (run_id, base_url, entity, chunk_start, chunk_end),
+            )
+            conn.commit()
+        finally:
+            conn.close()
         return "SKIPPED"
 
     now = datetime.now().isoformat(timespec="seconds")
@@ -595,6 +612,16 @@ def _write_gaps_sheet(
 # ================================== CLI ======================================
 
 
+def _default_out_dir() -> str:
+    """Каталог отчёта по умолчанию.
+
+    В контейнере рабочие данные живут в томе ``/data``; писать отчёт рядом с
+    ними, чтобы он переживал пересоздание контейнера. Вне Docker — локальный
+    ``exports/``.
+    """
+    return "/data/exports" if Path("/data").is_dir() else "exports"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m core.audit",
@@ -612,9 +639,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="Пауза между запросами, сек (по умолчанию 0.2)")
     parser.add_argument("--restart", action="store_true",
                         help="Перечитать COMPLETED-чанки заново")
-    parser.add_argument("--out", default="exports",
-                        help="Каталог отчёта (по умолчанию exports/)")
+    parser.add_argument("--out", default=None,
+                        help="Каталог отчёта (по умолчанию /data/exports в "
+                             "контейнере, иначе exports/)")
     args = parser.parse_args(argv)
+
+    if args.out is None:
+        args.out = _default_out_dir()
 
     base = _resolve_base(args.base)
     if base is None:
@@ -634,6 +665,16 @@ def main(argv: list[str] | None = None) -> int:
             include_unmapped=args.include_unmapped,
             restart=args.restart,
         )
+    except KeyboardInterrupt:
+        # Осознанный Ctrl+C, а не сбой: прогон и незавершённый чанк остаются
+        # в состоянии RUNNING, поэтому повторный запуск продолжит с места
+        # прерывания (COMPLETED-чанки пропускаются). Не пугаем трассировкой.
+        print(
+            "\nАудит приостановлен — состояние сохранено. "
+            "Повторный запуск той же команды продолжит с прерванного чанка.",
+            file=sys.stderr,
+        )
+        return 130
     except ValueError as e:
         print(f"Аудит не выполнен: {e}", file=sys.stderr)
         return 1
