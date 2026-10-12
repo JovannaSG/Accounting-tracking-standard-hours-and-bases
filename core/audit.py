@@ -651,12 +651,13 @@ def main(argv: list[str] | None = None) -> int:
         prog="python -m core.audit",
         description="Глубокий аудит данных баз 1С:Фреш (checkpoint-резюм).",
     )
-    parser.add_argument("--base", required=True,
+    parser.add_argument("--base",
                         help="Имя (или URL/id) базы из таблицы bases")
-    parser.add_argument("--start", required=True,
-                        help="Начало периода, YYYY-MM-DD")
-    parser.add_argument("--end", required=True,
-                        help="Конец периода, YYYY-MM-DD")
+    parser.add_argument("--start", help="Начало периода, YYYY-MM-DD")
+    parser.add_argument("--end", help="Конец периода, YYYY-MM-DD")
+    parser.add_argument("--list-bases", action="store_true",
+                        help="Напечатать активные базы как «id<TAB>имя» и выйти "
+                             "(источник списка для пакетного обхода)")
     parser.add_argument("--include-unmapped", action="store_true",
                         help="Подсчитать нереестровые Document_* из $metadata")
     parser.add_argument("--pause", type=float, default=0.2,
@@ -667,6 +668,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="Каталог отчёта (по умолчанию /data/exports в "
                              "контейнере, иначе exports/)")
     args = parser.parse_args(argv)
+
+    if args.list_bases:
+        for b in db.list_bases(active_only=True):
+            print(f"{b['id']}\t{b['name']}")
+        return 0
+
+    if not (args.base and args.start and args.end):
+        parser.error("--base, --start и --end обязательны (кроме --list-bases)")
 
     if args.out is None:
         args.out = _default_out_dir()

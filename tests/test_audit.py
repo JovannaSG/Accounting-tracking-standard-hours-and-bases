@@ -580,6 +580,32 @@ def test_main_summary_reports_skipped_count(monkeypatch, capsys):
     assert "ошибок 1" in out
 
 
+def test_list_bases_prints_active_id_and_name(capsys):
+    """--list-bases отдаёт «id<TAB>имя» — источник для пакетного обхода."""
+    b1 = db.insert_base("Аудит Список A", "https://list.example/a/1", "u", "p")
+    b2 = db.insert_base("Аудит Список B", "https://list.example/a/2", "u", "p")
+    db.insert_base("Аудит Список C", "https://list.example/a/3", "u", "p",
+                   active=False)
+
+    rc = audit.main(["--list-bases"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    rows = dict(
+        line.split("\t", 1) for line in out.splitlines() if line
+    )
+    assert rows[str(b1["id"])] == "Аудит Список A"
+    assert rows[str(b2["id"])] == "Аудит Список B"
+    # неактивная база в список не попадает
+    assert "Аудит Список C" not in rows.values()
+
+
+def test_main_requires_period_unless_listing():
+    """Без --list-bases период обязателен (argparse завершает с кодом 2)."""
+    with pytest.raises(SystemExit) as exc:
+        audit.main(["--base", "что угодно"])
+    assert exc.value.code == 2
+
+
 def test_resolve_base_by_name_and_url():
     base = db.insert_base(
         "Аудит Резолв", "https://resolve.example/a/1", "u", "p"
