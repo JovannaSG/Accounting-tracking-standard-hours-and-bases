@@ -74,10 +74,10 @@ class _FakeData:
         self.calls = 0
 
     def set_entity(self, name, *, rows=0, sum=0.0, count=None, fail=None,
-                   degrade=False):
+                   degrade=False, not_found=False):
         self.entities[name] = {
             "rows": rows, "sum": sum, "count": count, "fail": fail,
-            "degrade": degrade,
+            "degrade": degrade, "not_found": not_found,
         }
 
     def fake_get(self, url, params=None, timeout=None):
@@ -90,6 +90,8 @@ class _FakeData:
         spec = self.entities.get(entity)
         if spec is None:
             return _FakeResponse({"value": []}, 200)
+        if spec["not_found"]:
+            return _FakeResponse(None, 404)
         if "count=true" in url:
             if spec["count"] is None:
                 return _FakeResponse({"value": []}, 400)
@@ -383,6 +385,52 @@ def test_entity_error_marks_checkpoint_and_run_failed():
     assert cp["error"]
 
 
+def test_entity_404_is_not_applicable_not_failed(tmp_path):
+    """404 (сущность не активирована в базе) — не сбой, а «не применимо».
+
+    Регрессия: раньше отсутствующая сущность помечала чанк и весь прогон
+    FAILED, из-за чего каждая база без подсистемного контура (ГТД, зарплата)
+    выглядела сломанной в батч-мониторинге и «Проблемах».
+    """
+    fake = _FakeData()
+    fake.set_entity("Document_ГТД", not_found=True)
+    fc = _FakeClient(fake)
+
+    summary = audit.run_audit(
+        _BASE, "2026-01-01", "2026-01-31",
+        client=fc.client, pause=0.0,
+        entities=["Document_ГТД"],
+    )
+
+    # прогон здоров: сущности нет — это не ошибка
+    assert summary["run_status"] == db.AUDIT_RUN_COMPLETED
+    assert summary["chunks_failed"] == 0
+    assert summary["chunks_completed"] == 0
+    assert summary["chunks_skipped"] == 1
+    assert summary["count_mismatches"] == 0
+
+    cp = _checkpoint(_BASE["url"], "Document_ГТД", "2026-01-01", "2026-01-31")
+    assert cp["status"] == db.AUDIT_CP_COMPLETED
+    assert cp["rows_processed"] == 0
+    assert "404" in (cp["error"] or "")
+
+    # не попадает в «Проблемы»
+    path = audit.write_audit_report(summary, out_dir=str(tmp_path))
+    wb = openpyxl.load_workbook(path)
+    assert wb["Проблемы"].max_row == 1
+
+    # резюм не дёргает отсутствующую сущность повторно
+    n_before = fake.calls
+    second = audit.run_audit(
+        _BASE, "2026-01-01", "2026-01-31",
+        client=fc.client, pause=0.0,
+        entities=["Document_ГТД"],
+    )
+    assert second["chunks_skipped"] == 1
+    assert second["chunks_failed"] == 0
+    assert fake.calls == n_before
+
+
 # ============================= GAPS =========================================
 
 def test_include_unmapped_counts_non_registry_documents():
@@ -490,6 +538,46 @@ def test_main_unknown_base_returns_2(capsys):
     assert rc == 2
     err = capsys.readouterr().err
     assert "не найдена" in err
+
+
+def test_main_summary_reports_skipped_count(monkeypatch, capsys):
+    """Итоговая строка CLI показывает пропущенные чанки (а не только готово).
+
+    Регрессия: после резюма печаталось «готово 0, ошибок 2», что читалось как
+    «ничего не сделано».
+    """
+    base = db.insert_base(
+        "Аудит Сводка", "https://summary.example/a/1", "u", "p"
+    )
+    assert base is not None
+
+    summary = {
+        "base_name": "Аудит Сводка",
+        "base_url": base["url"],
+        "period_start": "2026-01-01",
+        "period_end": "2026-01-31",
+        "run_id": 1,
+        "chunks_total": 5,
+        "chunks_completed": 3,
+        "chunks_skipped": 1,
+        "chunks_failed": 1,
+        "count_mismatches": 0,
+        "degraded_entities": [],
+        "gaps_count": None,
+    }
+    monkeypatch.setattr(audit, "run_audit", lambda *a, **k: summary)
+    monkeypatch.setattr(
+        audit, "write_audit_report", lambda s, out_dir=None: "/tmp/fake.xlsx"
+    )
+    rc = audit.main([
+        "--base", "Аудит Сводка",
+        "--start", "2026-01-01", "--end", "2026-01-31",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "готово 3" in out
+    assert "пропущено 1" in out
+    assert "ошибок 1" in out
 
 
 def test_resolve_base_by_name_and_url():

@@ -27,11 +27,14 @@ from urllib.parse import quote
 import openpyxl
 
 from core import db
-from core.api_client import OneCClient
+from core.api_client import EntityNotFoundError, OneCClient
 from core.norms import load_doc_types
 from core.reporters import BORDER, CENTER, HEADER_FILL, HEADER_FONT
 
 _TIME = time  # патчится в тестах (паузы между запросами)
+
+# Возврат _run_chunk для сущности, отсутствующей в базе (404, не применимо).
+_CHUNK_NOT_APPLICABLE = "NOT_APPLICABLE"
 
 # ====================== ЧАНКИНГ ПО КАЛЕНДАРНЫМ МЕСЯЦАМ ======================
 
@@ -205,7 +208,7 @@ def run_audit(
                 client, run_id, base_url, entity,
                 chunk_start, chunk_end, pause, restart,
             )
-            if status == "SKIPPED":
+            if status in ("SKIPPED", _CHUNK_NOT_APPLICABLE):
                 summary["chunks_skipped"] += 1
             elif status == db.AUDIT_CP_COMPLETED:
                 summary["chunks_completed"] += 1
@@ -340,6 +343,27 @@ def _run_chunk(
         finally:
             conn.close()
         return db.AUDIT_CP_COMPLETED
+    except EntityNotFoundError:
+        # 404: сущности нет в этой базе (не активирован контур — ГТД, зарплата
+        # и т.п.). Это не сбой: помечаем COMPLETED с 0 строк, чтобы (а) резюм
+        # не дёргал её снова и (б) она не попала в «Проблемы». Пометка в
+        # error видна в «Сводке», но «Проблемы» фильтруют по COMPLETED.
+        finished = datetime.now().isoformat(timespec="seconds")
+        conn = db._audit_conn()
+        try:
+            conn.execute(
+                "UPDATE audit_checkpoints SET status=?, rows_processed=0, "
+                "sum_amount=0, page_count=0, degraded=0, expected_count=NULL, "
+                "count_available=0, count_mismatch=0, error=?, finished_at=? "
+                "WHERE base_url=? AND entity_name=? AND chunk_start=? "
+                "AND chunk_end=?",
+                (db.AUDIT_CP_COMPLETED, "сущность отсутствует в базе (404)",
+                 finished, base_url, entity, chunk_start, chunk_end),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return _CHUNK_NOT_APPLICABLE
     except Exception as e:
         failed = datetime.now().isoformat(timespec="seconds")
         conn = db._audit_conn()
@@ -683,7 +707,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Отчёт: {path}")
     print(
         f"Чанков: {summary['chunks_total']} (готово "
-        f"{summary['chunks_completed']}, ошибок {summary['chunks_failed']}), "
+        f"{summary['chunks_completed']}, пропущено "
+        f"{summary['chunks_skipped']}, ошибок {summary['chunks_failed']}), "
         f"расхождений с $count: {summary['count_mismatches']}"
     )
     if summary["degraded_entities"]:

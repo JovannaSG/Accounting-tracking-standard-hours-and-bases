@@ -34,6 +34,17 @@ _schema_cache: dict[str, Any] | None = None
 _DEFAULT_RETRY_TOTAL = 5
 
 
+class EntityNotFoundError(ValueError):
+    """Сущность отсутствует в базе (OData 404).
+
+    Не сетевой сбой и не ошибка данных: у конкретного тенанта может быть не
+    активирован подсистемный контур (ГТД, зарплата и т.п.). Наследует
+    ``ValueError`` для совместимости с существующими ``except ValueError``,
+    но проверка ``_is_select_error`` (400/500) его не перехватывает — оно
+    доходит до аудита, который трактует 404 как «не применимо», а не FAILED.
+    """
+
+
 def _load_schema() -> dict[str, Any]:
     """Лениво читает снимок odata_schema.json (офлайн-выбор полей выгрузки)."""
     global _schema_cache
@@ -122,6 +133,14 @@ class OneCClient:
                 f"1С не ответила после {_DEFAULT_RETRY_TOTAL} повторов: {e}"
             ) from e
         except HTTPError as e:
+            status = (
+                e.response.status_code if e.response is not None else None
+            )
+            if status == 404:
+                url = e.response.url if e.response is not None else endpoint
+                raise EntityNotFoundError(
+                    f"OData-сущность отсутствует в базе (404): {url}"
+                ) from e
             raise ValueError(self._friendly_http_error(e)) from e
         except RequestException as e:
             raise ValueError(f"Не удалось соединиться с 1C: {e}") from e
