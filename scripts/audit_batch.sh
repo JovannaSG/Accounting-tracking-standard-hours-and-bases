@@ -21,6 +21,8 @@
 #     AUDIT_BATCH_START  начало периода (по умолчанию 2026-01-01)
 #     AUDIT_BATCH_END    конец периода  (по умолчанию 2026-12-31)
 #     AUDIT_BATCH_PAUSE  пауза между запросами, сек (по умолчанию 0.2)
+#     AUDIT_BATCH_SUMMARY  путь сводки внутри контейнера (по умолчанию
+#                          /data/exports/norm_hours_audit_summary.csv)
 #
 # Отчёты пишутся внутри контейнера в /data/exports (том norm-hours-data).
 
@@ -33,6 +35,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 cd "$(dirname "$0")/.." || exit 1
 
 LOGFILE="${AUDIT_BATCH_LOG:-/var/log/norm_hours_audit.log}"
+SUMMARY_FILE="${AUDIT_BATCH_SUMMARY:-/data/exports/norm_hours_audit_summary.csv}"
 YEAR_START="${AUDIT_BATCH_START:-2026-01-01}"
 YEAR_END="${AUDIT_BATCH_END:-2026-12-31}"
 PAUSE="${AUDIT_BATCH_PAUSE:-0.2}"
@@ -78,3 +81,10 @@ done <<< "$BASES"
 
 echo "=================================================================="
 echo "[$(date '+%F %T')] Готово: всего $total, успешно $ok, с ошибкой $failed"
+
+# Итоговая сводка (та же БД истории, без сети) — в лог и отдельным файлом
+# внутри тома /data (переживает пересоздание контейнера).
+echo "------------------------------------------------------------------"
+echo "[$(date '+%F %T')] Сводка по базам с проблемами:"
+"${COMPOSE[@]}" exec -T norm-hours python -m core.audit --summary --problems-only || true
+"${COMPOSE[@]}" exec -T norm-hours python -m core.audit --summary --out "$SUMMARY_FILE" || true
