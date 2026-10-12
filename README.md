@@ -135,6 +135,7 @@ core/                 Бизнес-логика
   doc_types.json      Реестр видов документов MVP
 tests/                Автотесты (pytest, изолированная БД)
 scripts/audit_batch.sh  Пакетный обход всех активных баз (cron/nohup)
+scripts/audit_batch_local.sh  То же без Docker (локально, на .venv)
 docs/                 ТЗ, справочник базовых норм, список сотрудников
                       и руководство администратора
 client_databases.json Выгрузка клиентских баз 1С для импорта

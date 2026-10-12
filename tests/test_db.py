@@ -1011,6 +1011,35 @@ def test_list_audit_runs_orders_by_id_desc(monkeypatch):
     assert [r["period_start"] for r in runs] == ["2026-02-01", "2026-01-01"]
     assert runs[1]["status"] == "COMPLETED"
 
+
+def test_list_audit_checkpoints_by_base_filters_and_orders(monkeypatch):
+    tmp = tempfile.mkdtemp(prefix="audit_by_base_")
+    path = os.path.join(tmp, "audit.db")
+    monkeypatch.setattr(db, "_AUDIT_DB_PATH", path)
+    db.init_audit_db()
+
+    conn = sqlite3.connect(path)
+    try:
+        for url, entity in (
+            ("https://b.example/a/1", "Document_B"),
+            ("https://b.example/a/1", "Document_A"),
+            ("https://b.example/a/2", "Document_A"),
+        ):
+            conn.execute(
+                "INSERT INTO audit_checkpoints (base_url, entity_name, "
+                "chunk_start, chunk_end, status) VALUES (?, ?, ?, ?, ?)",
+                (url, entity, "2026-01-01", "2026-01-31",
+                 db.AUDIT_CP_COMPLETED),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rows = db.list_audit_checkpoints_by_base("https://b.example/a/1")
+    # только своя база и упорядочение по entity_name
+    assert [r["entity_name"] for r in rows] == ["Document_A", "Document_B"]
+    assert all(r["base_url"] == "https://b.example/a/1" for r in rows)
+
 # ============ СКИМ-ДРИФТ: init_db() МОЖЕТ ТОЛЬКО ДОБАВЛЯТЬ ================
 
 def _schema_snapshot(path: str) -> dict:

@@ -606,6 +606,120 @@ def test_main_requires_period_unless_listing():
     assert exc.value.code == 2
 
 
+def _seed_base_audit(name, url, *, rows, amount, count):
+    """Прогон аудита одной сущности за месяц — чтобы появилась история."""
+
+    base = db.insert_base(name, url, "u", "p")
+    fake = _FakeData()
+    fake.set_entity("Document_A", rows=rows, sum=amount, count=count)
+    fc = _FakeClient(fake)
+    audit.run_audit(
+        {**_BASE, "id": base["id"], "name": name, "url": url},
+        "2026-01-01", "2026-01-31",
+        client=fc.client, pause=0.0, entities=["Document_A"],
+    )
+    return base
+
+
+def test_summary_overview_lists_bases_with_status(capsys):
+    _seed_base_audit("Сводка Чистая", "https://s.example/a/1",
+                     rows=2, amount=20.0, count=2)
+    _seed_base_audit("Сводка Проблемная", "https://s.example/a/2",
+                     rows=1, amount=10.0, count=5)  # расхождение $count
+
+    rc = audit.main(["--summary"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Сводка Чистая" in out
+    assert "Сводка Проблемная" in out
+
+    rows = audit.audit_summary()
+    by_name = {r["base_name"]: r for r in rows}
+    assert by_name["Сводка Чистая"]["has_problems"] is False
+    assert by_name["Сводка Чистая"]["chunks_done"] == 1
+    assert by_name["Сводка Проблемная"]["has_problems"] is True
+    assert by_name["Сводка Проблемная"]["mismatches"] == 1
+    # проблемные базы идут первыми
+    assert rows[0]["base_name"] == "Сводка Проблемная"
+
+
+def test_summary_problems_only_filters_clean_bases(capsys):
+    _seed_base_audit("Сводка Чистая2", "https://s.example/b/1",
+                     rows=2, amount=20.0, count=2)
+    _seed_base_audit("Сводка Проблемная2", "https://s.example/b/2",
+                     rows=1, amount=10.0, count=9)
+
+    rc = audit.main(["--summary", "--problems-only"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Сводка Проблемная2" in out
+    assert "Сводка Чистая2" not in out
+
+
+def test_summary_base_detail_shows_entities(capsys):
+    _seed_base_audit("Сводка Деталь", "https://s.example/c/1",
+                     rows=1, amount=10.0, count=3)
+
+    rc = audit.main(["--summary", "--base", "Сводка Деталь"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Детализация по сущностям" in out
+    assert "Document_A" in out
+
+
+def test_summary_json_output(capsys):
+    _seed_base_audit("Сводка JSON", "https://s.example/d/1",
+                     rows=2, amount=20.0, count=2)
+
+    rc = audit.main(["--summary", "--json"])
+    assert rc == 0
+    import json
+
+    data = json.loads(capsys.readouterr().out)
+    assert isinstance(data, list) and data
+    assert data[0]["base_name"] == "Сводка JSON"
+    assert {"has_problems", "chunks_done", "chunks_failed"} <= set(data[0])
+
+
+def test_summary_out_writes_file(tmp_path, capsys):
+    _seed_base_audit("Сводка Файл", "https://s.example/e/1",
+                     rows=2, amount=20.0, count=2)
+    out_file = tmp_path / "summary.json"
+
+    rc = audit.main(["--summary", "--json", "--out", str(out_file)])
+    assert rc == 0
+    assert f"Сводка: {out_file}" in capsys.readouterr().out
+
+    import json
+
+    data = json.loads(out_file.read_text(encoding="utf-8"))
+    assert data[0]["base_name"] == "Сводка Файл"
+
+
+def test_summary_out_writes_csv(tmp_path):
+    _seed_base_audit("Сводка CSV", "https://s.example/f/1",
+                     rows=2, amount=20.0, count=2)
+    out_file = tmp_path / "summary.csv"
+
+    rc = audit.main(["--summary", "--out", str(out_file)])
+    assert rc == 0
+    text = out_file.read_text(encoding="utf-8-sig")
+    assert "База;id;Прогон" in text
+    assert "Сводка CSV" in text
+
+
+def test_summary_empty_history_is_ok(capsys):
+    rc = audit.main(["--summary"])
+    assert rc == 0
+    assert "База" in capsys.readouterr().out
+
+
+def test_summary_unknown_base_returns_2(capsys):
+    rc = audit.main(["--summary", "--base", "ТакойБазыНет-999"])
+    assert rc == 2
+    assert "не найдена" in capsys.readouterr().err
+
+
 def test_resolve_base_by_name_and_url():
     base = db.insert_base(
         "Аудит Резолв", "https://resolve.example/a/1", "u", "p"

@@ -636,6 +636,203 @@ def _write_gaps_sheet(
 # ================================== CLI ======================================
 
 
+def _problems_in_checkpoints(checkpoints: list[dict]) -> list[dict]:
+    """Проблемные чанки по тем же правилам, что лист «Проблемы» отчёта."""
+
+    return [
+        cp for cp in checkpoints
+        if cp["status"] == db.AUDIT_CP_FAILED
+        or cp["count_mismatch"]
+        or cp["degraded"]
+    ]
+
+
+def _summarize_base(base: dict | None, base_url: str) -> dict:
+    """Сводка текущего состояния аудита одной базы (из БД, без сети).
+
+    Агрегирует checkpoint'ы по ``base_url`` (см.
+    ``db.list_audit_checkpoints_by_base``); статусы чанков: ``done`` —
+    завершён со строками, ``empty`` — завершён с 0 строк (отсутствующая
+    сущность 404 или пропуск при резюме), ``failed`` — ошибка. Явный
+    «пропущено» в БД не хранится, поэтому не подделывается.
+    """
+
+    checkpoints = db.list_audit_checkpoints_by_base(base_url)
+    done = empty = failed = 0
+    rows_total = 0
+    sum_total = 0.0
+    for cp in checkpoints:
+        if cp["status"] == db.AUDIT_CP_FAILED:
+            failed += 1
+            continue
+        if cp["status"] == db.AUDIT_CP_COMPLETED:
+            rows_total += cp["rows_processed"] or 0
+            sum_total += cp["sum_amount"] or 0.0
+            if cp["rows_processed"]:
+                done += 1
+            else:
+                empty += 1
+
+    runs = db.list_audit_runs(base_url=base_url)
+    latest = runs[0] if runs else {}
+    gaps = db.list_audit_gap_counts(base_url)
+    problems = _problems_in_checkpoints(checkpoints)
+
+    return {
+        "base_name": (base or {}).get("name") or base_url,
+        "base_url": base_url,
+        "base_id": (base or {}).get("id"),
+        "run_id": latest.get("id"),
+        "run_status": latest.get("status"),
+        "period_start": latest.get("period_start"),
+        "period_end": latest.get("period_end"),
+        "include_unmapped": bool(latest.get("include_unmapped")),
+        "created_at": latest.get("created_at"),
+        "finished_at": latest.get("finished_at"),
+        "chunks_total": len(checkpoints),
+        "chunks_done": done,
+        "chunks_empty": empty,
+        "chunks_failed": failed,
+        "rows_total": rows_total,
+        "sum_total": round(sum_total, 2),
+        "mismatches": sum(1 for cp in checkpoints if cp["count_mismatch"]),
+        "degraded": sum(1 for cp in checkpoints if cp["degraded"]),
+        "gaps_count": len(gaps),
+        "problems": len(problems),
+        "has_problems": bool(problems),
+    }
+
+
+def audit_summary(base_filter: str | None = None) -> list[dict]:
+    """Сводка по базам с историей аудита (свежие базы — по имени).
+
+    ``base_filter`` (имя/URL/id) сужает до одной базы; неизвестная — ValueError.
+    """
+
+    names = {b["url"].rstrip("/"): b for b in db.list_bases()}
+
+    if base_filter:
+        base = _resolve_base(base_filter)
+        if base is None:
+            raise ValueError(f"База '{base_filter}' не найдена")
+        return [_summarize_base(base, str(base["url"]).rstrip("/"))]
+
+    urls: list[str] = []
+    for run in db.list_audit_runs():
+        url = str(run["base_url"]).rstrip("/")
+        if url not in urls:
+            urls.append(url)
+
+    rows = [_summarize_base(names.get(url), url) for url in urls]
+    rows.sort(key=lambda r: (not r["has_problems"], str(r["base_name"]).lower()))
+    return rows
+
+
+def audit_base_detail(base_url: str) -> list[dict]:
+    """Разбивка чанков базы по сущностям (для ``--summary --base``)."""
+
+    by_entity: dict[str, dict] = {}
+    for cp in db.list_audit_checkpoints_by_base(base_url):
+        row = by_entity.setdefault(cp["entity_name"], {
+            "entity_name": cp["entity_name"], "chunks": 0, "rows": 0,
+            "sum": 0.0, "mismatches": 0, "degraded": 0, "failed": 0,
+        })
+        row["chunks"] += 1
+        row["rows"] += cp["rows_processed"] or 0
+        row["sum"] += cp["sum_amount"] or 0.0
+        if cp["status"] == db.AUDIT_CP_FAILED:
+            row["failed"] += 1
+        if cp["count_mismatch"]:
+            row["mismatches"] += 1
+        if cp["degraded"]:
+            row["degraded"] += 1
+    detail = list(by_entity.values())
+    for row in detail:
+        row["sum"] = round(row["sum"], 2)
+    return detail
+
+
+def _render_table(headers: list[str], rows: list[list]) -> str:
+    """Простая выровненная таблица (ширины по содержимому)."""
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, value in enumerate(row):
+            widths[i] = max(widths[i], len(str(value)))
+    lines = ["  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))]
+    lines.append("  ".join("-" * w for w in widths))
+    for row in rows:
+        lines.append("  ".join(str(v).ljust(widths[i])
+                               for i, v in enumerate(row)))
+    return "\n".join(lines)
+
+
+_SUMMARY_HEADERS = [
+    "База", "id", "Прогон", "Статус", "Период", "Чанков",
+    "Готово", "Пусто", "Ошибок", "Расхожд.", "Данных-бедно", "Gaps", "Проблемы",
+]
+
+
+def _summary_row_values(row: dict) -> list:
+    period = (
+        f"{row['period_start']}..{row['period_end']}"
+        if row["period_start"] else "-"
+    )
+    return [
+        row["base_name"], row["base_id"] if row["base_id"] is not None else "-",
+        row["run_id"] if row["run_id"] is not None else "-",
+        row["run_status"] or "-", period, row["chunks_total"],
+        row["chunks_done"], row["chunks_empty"], row["chunks_failed"],
+        row["mismatches"], row["degraded"], row["gaps_count"],
+        row["problems"] if row["problems"] else "",
+    ]
+
+
+def _format_summary_table(rows: list[dict]) -> str:
+    return _render_table(_SUMMARY_HEADERS, [_summary_row_values(r) for r in rows])
+
+
+def _format_base_detail(row: dict) -> str:
+    """Сводка одной базы + таблица по сущностям."""
+
+    block = [_render_table(_SUMMARY_HEADERS, [_summary_row_values(row)]), ""]
+    detail = audit_base_detail(row["base_url"])
+    headers = ["Сущность", "Чанков", "Строк", "Сумма документов",
+               "Расхожд.", "Данных-бедно", "Ошибок"]
+    values = [
+        [d["entity_name"], d["chunks"], d["rows"], d["sum"],
+         d["mismatches"], d["degraded"], d["failed"]]
+        for d in detail
+    ]
+    block.append(f"Детализация по сущностям ({len(detail)}):")
+    block.append(_render_table(headers, values) if values
+                 else "(нет данных)")
+    return "\n".join(block)
+
+
+def _summary_json(rows: list[dict]) -> str:
+    import json
+
+    return json.dumps(rows, ensure_ascii=False, indent=2)
+
+
+def _write_summary_file(path: str, rows: list[dict], as_json: bool) -> None:
+    """Сохраняет плоскую сводку в файл: JSON либо CSV (разделитель «;»)."""
+
+    if as_json:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(_summary_json(rows))
+        return
+
+    import csv
+
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f, delimiter=";")
+        writer.writerow(_SUMMARY_HEADERS)
+        for row in rows:
+            writer.writerow(_summary_row_values(row))
+
+
 def _default_out_dir() -> str:
     """Каталог отчёта по умолчанию.
 
@@ -658,6 +855,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--list-bases", action="store_true",
                         help="Напечатать активные базы как «id<TAB>имя» и выйти "
                              "(источник списка для пакетного обхода)")
+    parser.add_argument("--summary", action="store_true",
+                        help="Сводка по истории аудита (без сети): по базам "
+                             "или по одной с --base")
+    parser.add_argument("--problems-only", action="store_true",
+                        help="С --summary: только базы с проблемами")
+    parser.add_argument("--json", action="store_true",
+                        help="С --summary: вывести JSON вместо таблицы")
     parser.add_argument("--include-unmapped", action="store_true",
                         help="Подсчитать нереестровые Document_* из $metadata")
     parser.add_argument("--pause", type=float, default=0.2,
@@ -665,8 +869,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--restart", action="store_true",
                         help="Перечитать COMPLETED-чанки заново")
     parser.add_argument("--out", default=None,
-                        help="Каталог отчёта (по умолчанию /data/exports в "
-                             "контейнере, иначе exports/)")
+                        help="Для аудита — каталог отчёта (по умолчанию "
+                             "/data/exports в контейнере, иначе exports/); "
+                             "для --summary — файл (JSON при --json, иначе CSV)")
     args = parser.parse_args(argv)
 
     if args.list_bases:
@@ -674,8 +879,28 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{b['id']}\t{b['name']}")
         return 0
 
+    if args.summary:
+        try:
+            rows = audit_summary(args.base)
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 2
+        if args.problems_only:
+            rows = [r for r in rows if r["has_problems"]]
+        if args.base and rows:
+            payload = _summary_json(rows) if args.json else _format_base_detail(rows[0])
+        else:
+            payload = _summary_json(rows) if args.json else _format_summary_table(rows)
+        if args.out:
+            _write_summary_file(args.out, rows, as_json=args.json)
+            print(f"Сводка: {args.out}")
+        else:
+            print(payload)
+        return 0
+
     if not (args.base and args.start and args.end):
-        parser.error("--base, --start и --end обязательны (кроме --list-bases)")
+        parser.error("--base, --start и --end обязательны "
+                     "(кроме --list-bases и --summary)")
 
     if args.out is None:
         args.out = _default_out_dir()

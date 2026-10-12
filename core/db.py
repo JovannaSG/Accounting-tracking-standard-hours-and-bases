@@ -1727,6 +1727,28 @@ def list_audit_checkpoints(run_id: int) -> list[dict]:
         conn.close()
 
 
+def list_audit_checkpoints_by_base(base_url: str) -> list[dict]:
+    """Текущее состояние всех чанков базы (последнее по каждому).
+
+    ``audit_checkpoints`` уникальна по ``(base_url, entity_name, chunk_start,
+    chunk_end)``, поэтому запрос по ``base_url`` (а не по ``run_id``) отдаёт
+    актуальное состояние чанков, даже если прогон прерывался и резюмировался
+    под разными ``run_id``. Источник для ``--summary``.
+    """
+
+    conn = _audit_conn()
+    try:
+        cursor = conn.execute(
+            "SELECT " + ", ".join(_AUDIT_CHECKPOINTS_COLUMNS)
+            + " FROM audit_checkpoints WHERE base_url = ?"
+            + " ORDER BY entity_name, chunk_start",
+            (base_url,),
+        )
+        return [_audit_row(r, _AUDIT_CHECKPOINTS_COLUMNS) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
 def list_audit_gap_counts(base_url: str) -> list[dict]:
     conn = _audit_conn()
     try:
