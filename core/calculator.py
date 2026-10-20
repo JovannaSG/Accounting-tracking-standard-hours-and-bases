@@ -1,7 +1,7 @@
 import pandas as pd
 
 from core import db
-from core.employees import match_employee
+from core.employees import resolve_employee_smart
 
 # Схема отчёта после агрегации (ТЗ §6.1)
 REPORT_COLUMNS: list[str] = [
@@ -26,6 +26,53 @@ def _row_to_key(row: pd.Series) -> str:
     return _norm_name(row.get("Ответственный сотрудник"))
 
 
+def build_norm_index() -> dict[str, dict]:
+    """Индекс активных норм по наименованию вида документа.
+
+    Варианты форм в БП могут иметь одинаковый ``title``; приоритет у первой
+    активной нормы — ровно то поведение, которое исторически использовал
+    отчёт (``setdefault``).
+    """
+
+    by_title: dict[str, dict] = {}
+    for n in db.list_norms(active_only=True):
+        by_title.setdefault(n["title"], n)
+    return by_title
+
+
+def resolve_business_row(
+    author: str,
+    title: str,
+    operations: float,
+    by_title: dict[str, dict],
+    employees: list[dict],
+) -> dict:
+    """Норма/сотрудник/часы для одной строки — общая логика отчёта и аудита.
+
+    ``employees`` передаётся готовым списком: аудит обрабатывает миллионы
+    документов, поэтому резолвер не должен ходить в БД на каждую запись.
+    """
+
+    norm = by_title.get(str(title or ""))
+    emp = resolve_employee_smart(author, employees)
+    full_name = emp["full_name"] if emp else "Не распределено"
+    role = emp["role"] or "" if emp else "Не распределено"
+
+    norm_hours = float(norm["norm_hours"]) if norm else 0.0
+    coeff = float(norm["coeff"]) if norm else 1.00
+    hours = float(operations or 0) * norm_hours * coeff
+    comment = (norm["comment"] or "") if norm else "Норма не задана"
+
+    return {
+        "full_name": full_name,
+        "role": role,
+        "norm_hours": norm_hours,
+        "coeff": coeff,
+        "hours": round(hours, 6),
+        "comment": comment,
+    }
+
+
 def apply_norms_and_employees(df: pd.DataFrame) -> pd.DataFrame:
     """
     Проставляет по каждой строке: норму (по виду документа), коэффициент,
@@ -34,51 +81,28 @@ def apply_norms_and_employees(df: pd.DataFrame) -> pd.DataFrame:
     """
 
     out = df.copy()
-    norms = {n["doc_type"]: n for n in db.list_norms(active_only=True)}
-    # Индекс норм по наименованию вида документа (варианты форм в БП)
-    by_title: dict[str, dict] = {}
-    for n in norms.values():
-        by_title.setdefault(n["title"], n)
+    by_title = build_norm_index()
+    employees = db.list_employees(active_only=True)
 
     rows: list[dict] = []
     for _, rec in out.iterrows():
         title = str(rec.get("Вид документа") or "")
-        norm = by_title.get(title) or _match_by_entity(rec, norms)
-
         author = _row_to_key(rec)
-        emp = match_employee(author)
-        full_name = emp["full_name"] if emp else "Не распределено"
-        role = emp["role"] or "" if emp else "Не распределено"
-
-        norm_hours = float(norm["norm_hours"]) if norm else 0.0
-        coeff = float(norm["coeff"]) if norm else 1.00
-        hours = float(rec.get("Количество операций") or 0) * norm_hours * coeff
-        comment = (norm["comment"] or "") if norm else "Норма не задана"
+        business = resolve_business_row(
+            author, title, rec.get("Количество операций") or 0,
+            by_title, employees,
+        )
 
         r = dict(rec)
-        r["Ответственный сотрудник"] = full_name
-        r["Роль сотрудника"] = role
-        r["Норма на операцию"] = norm_hours
-        r["Коэффициент сложности"] = coeff
-        r["Трудозатраты, нормочасы"] = round(hours, 6)
-        r["Комментарий"] = comment
+        r["Ответственный сотрудник"] = business["full_name"]
+        r["Роль сотрудника"] = business["role"]
+        r["Норма на операцию"] = business["norm_hours"]
+        r["Коэффициент сложности"] = business["coeff"]
+        r["Трудозатраты, нормочасы"] = business["hours"]
+        r["Комментарий"] = business["comment"]
         rows.append(r)
 
     return pd.DataFrame(rows, columns=REPORT_COLUMNS)
-
-
-def _match_by_entity(rec, norms: dict) -> dict | None:
-    """
-    Запасной матчинг нормы: по doc_type из doc_types.json невозможен здесь
-    (в DataFrame только наименование), поэтому ищем по точному совпадению
-    наименования категории + наименования вида документа
-    """
-
-    title = str(rec.get("Вид документа") or "")
-    for n in norms.values():
-        if n["title"] == title:
-            return n
-    return None
 
 
 def find_missing_norms(df: pd.DataFrame) -> list[str]:

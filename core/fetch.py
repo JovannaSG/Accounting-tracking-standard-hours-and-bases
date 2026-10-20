@@ -28,7 +28,7 @@ def _variant_value(rec: dict, spec: dict) -> str:
     return str(rec.get(field) or "")
 
 
-def _resolve_key(
+def resolve_doc_spec(
     entries: list[tuple[str, dict]],
     rec: dict,
 ) -> tuple[str, dict]:
@@ -84,6 +84,11 @@ def _resolve_key(
     return entries[0]
 
 
+# Обратная совместимость: тесты и внешний код исторически используют
+# приватное имя.
+_resolve_key = resolve_doc_spec
+
+
 def fetch_documents(
     client: OneCClient,
     period_start: str,
@@ -133,7 +138,7 @@ def fetch_documents(
             continue
 
         for rec in records:
-            key, spec = _resolve_key(entries, rec)
+            key, spec = resolve_doc_spec(entries, rec)
             org_guid = rec.get("Организация_Key")
             org = client.organization_info(org_guid) if org_guid else {}
             author_guid = rec.get("Ответственный_Key")

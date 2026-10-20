@@ -1135,3 +1135,214 @@ def test_save_loop_never_overwrites_existing_norm(clean_db, scanner_enabled):
     # И это засчитано как пропуск, а не как ошибка.
     assert "Пропущено (уже есть): 1" in "\n".join(e.value for e in at.error) or \
            "Пропущено (уже есть): 1" in "\n".join(s.value for s in at.success)
+
+
+# ======================= Вкладка глубокого аудита ============================
+
+
+@pytest.fixture
+def audit_dashboard_enabled():
+    """Включает вкладку аудита и возвращает флаг обратно."""
+    from core import config
+    original = config.ENABLE_AUDIT_DASHBOARD
+    config.ENABLE_AUDIT_DASHBOARD = True
+    yield
+    config.ENABLE_AUDIT_DASHBOARD = original
+
+
+def _seed_audit_run(base_url: str, status: str = "COMPLETED") -> int:
+    conn = db._audit_conn()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO audit_runs (base_url, period_start, period_end, "
+            "include_unmapped, status, created_at) VALUES (?,?,?,?,?,?)",
+            (base_url, "2026-01-01", "2026-01-31", 0, status,
+             "2026-02-01T00:00:00"),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+    finally:
+        conn.close()
+
+
+def _button_by_label(at, label: str):
+    return [b for b in at.button if b.label == label]
+
+
+def test_audit_tab_absent_when_flag_disabled(clean_db):
+    from core import config
+    config.ENABLE_AUDIT_DASHBOARD = False
+
+    at = _run_app()
+    assert not at.exception
+    assert "Аудит" not in {t.label for t in at.tabs}
+    assert not _has_key(at, "radio", "audit_scope")
+
+
+def test_audit_tab_present_with_launch_form(clean_db, audit_dashboard_enabled):
+    at = _run_app()
+    assert not at.exception
+    assert "Аудит" in {t.label for t in at.tabs}
+    assert _has_key(at, "radio", "audit_scope")
+    assert _has_key(at, "selectbox", "audit_base")
+    assert _has_key(at, "date_input", "audit_start")
+    assert _has_key(at, "date_input", "audit_end")
+    assert _has_key(at, "checkbox", "audit_unmapped")
+    assert _has_key(at, "button", "audit_refresh")
+
+
+def test_audit_tab_empty_history_message(clean_db, audit_dashboard_enabled):
+    at = _run_app()
+    assert not at.exception
+    text = "\n".join(i.value for i in at.info)
+    assert "История аудита пуста" in text
+
+
+def test_audit_scope_toggle_enables_base_selectbox(
+    clean_db, audit_dashboard_enabled
+):
+    """Переключатель «Одна база» оживляет selectbox выбора базы.
+
+    Регрессия: radio и selectbox находились внутри одной st.form, поэтому
+    переключение области не вызывало перерисовку и поле базы оставалось
+    недоступным (disabled). Radio вынесен из формы — Streamlit-канон для
+    зависимых виджетов.
+    """
+    db.insert_base("Аудит Витрина", "https://dash.example/a/1", "u", "p")
+    at = _run_app()
+    assert not at.exception
+
+    radios = [w for w in at.radio if getattr(w, "key", None) == "audit_scope"]
+    assert radios, "нет radio области аудита"
+    boxes = [w for w in at.selectbox if getattr(w, "key", None) == "audit_base"]
+    assert boxes, "нет selectbox базы"
+    assert boxes[0].disabled is True, "база должна быть недоступна на «Все базы»"
+
+    radios[0].set_value("Одна база")
+    at.run()
+    boxes = [w for w in at.selectbox if getattr(w, "key", None) == "audit_base"]
+    assert boxes and boxes[0].disabled is False, "база недоступна на «Одна база»"
+
+    r2 = [w for w in at.radio if getattr(w, "key", None) == "audit_scope"]
+    r2[0].set_value("Все базы")
+    at.run()
+    boxes = [w for w in at.selectbox if getattr(w, "key", None) == "audit_base"]
+    assert boxes and boxes[0].disabled is True, "база должна снова выключиться"
+
+
+def test_audit_summary_row_text_always_dark():
+    """Подсветка строк сводки аудита задаёт и тёмный цвет текста.
+
+    Регрессия: Streamlit красит текст ячеек цветом активной темы — под тёмной
+    темой браузера строки на бледной подложке (+#d4edda/#fff3cd/#f8d7da)
+    становились белыми («белое на белом»). Текст теперь явно #1c1e21.
+    """
+    from app.ui import _audit_summary_table
+
+    row = {
+        "base_name": "Аудит Витрина",
+        "run_status": "COMPLETED",
+        "period_start": "2026-01-01",
+        "period_end": "2026-12-31",
+        "chunks_done": 1,
+        "chunks_total": 1,
+        "chunks_empty": 0,
+        "chunks_failed": 0,
+        "rows_total": 10,
+        "sum_total": "1 234,56",
+        "mismatches": 0,
+        "gaps_count": 0,
+        "problems": 0,
+        "has_problems": False,
+    }
+    css = _audit_summary_table([row]).to_html()
+    assert "color: #1c1e21" in css or "color:#1c1e21" in css, (
+        "ошибка подсветки: нет явного тёмного цвета текста"
+    )
+    assert "background-color: #d4edda" in css, (
+        "ошибка подсветки: нет фона «чисто» для строки без проблем"
+    )
+
+
+def test_audit_tab_shows_summary_table(clean_db, audit_dashboard_enabled):
+    db.insert_base("Аудит Витрина", "https://dash.example/a/1", "u", "p")
+    _seed_audit_run("https://dash.example/a/1")
+    at = _run_app()
+    assert not at.exception
+    assert len(at.dataframe) >= 1
+
+
+def test_audit_tab_shows_business_hours_by_company_and_employee(
+    clean_db, audit_dashboard_enabled
+):
+    url = "https://dash.example/a/1"
+    db.insert_base("Аудит Витрина", url, "u", "p")
+    run_id = _seed_audit_run(url)
+    db.replace_audit_hours(
+        url, "Document_A", "2026-01-01", "2026-01-31", run_id,
+        [
+            {"company": "ООО Ромашка", "employee": "Иванова Анна",
+             "operations": 3, "hours": 1.5},
+            {"company": "ООО Лютик", "employee": "Не распределено",
+             "operations": 1, "hours": 0.25},
+        ],
+    )
+
+    at = _run_app()
+    assert not at.exception
+    frames = [
+        d.value for d in at.dataframe
+        if {"Компания", "Сотрудник", "Нормочасы"} <= set(d.value.columns)
+    ]
+    assert frames, "нет бизнес-таблицы нормочасов"
+    view = frames[0]
+    assert "ООО Ромашка" in set(view["Компания"])
+    assert "Иванова Анна" in set(view["Сотрудник"])
+    assert view["Нормочасы"].sum() == 1.75
+
+    totals = [
+        d.value for d in at.dataframe
+        if list(d.value.columns) == ["Компания", "Операций", "Нормочасы"]
+    ]
+    assert totals, "нет промежуточных итогов по компаниям"
+    assert set(totals[0]["Компания"]) == {"ООО Ромашка", "ООО Лютик"}
+
+
+def test_audit_launch_disabled_and_stop_shown_while_running(
+    clean_db, audit_dashboard_enabled, monkeypatch
+):
+    from core import audit_runner
+
+    monkeypatch.setattr(
+        audit_runner, "status",
+        lambda *a, **k: {"running": True, "pid": 4321, "scope": "all",
+                         "start": "2026-01-01", "end": "2026-12-31"},
+    )
+    at = _run_app()
+    assert not at.exception
+    assert _button_by_label(at, "Остановить аудит"), "нет кнопки остановки"
+    launch = _button_by_label(at, "Запустить аудит")
+    assert launch and launch[0].disabled is True
+    warn = "\n".join(w.value for w in at.warning)
+    assert "Аудит выполняется" in warn
+
+
+def test_audit_stop_button_signals_runner(
+    clean_db, audit_dashboard_enabled, monkeypatch
+):
+    from core import audit_runner
+
+    monkeypatch.setattr(
+        audit_runner, "status",
+        lambda *a, **k: {"running": True, "pid": 4321, "scope": "all"},
+    )
+    called = {"stop": 0}
+    monkeypatch.setattr(
+        audit_runner, "stop",
+        lambda *a, **k: called.__setitem__("stop", called["stop"] + 1),
+    )
+    at = _run_app()
+    at.button(key="audit_stop").click()
+    at.run()
+    assert not at.exception
+    assert called["stop"] == 1

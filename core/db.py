@@ -1588,7 +1588,15 @@ _AUDIT_CHECKPOINTS_COLUMNS = (
 
 _AUDIT_GAPS_COLUMNS = (
     "id", "base_url", "entity_name", "run_id", "doc_count",
-    "count_available", "updated_at",
+    "count_available", "count_source", "updated_at",
+)
+
+# Нормочасы по итогам аудита: агрегат (компания × сотрудник) на чанк.
+# Хранится отдельно от checkpoint'ов: чанк можно перечитать, не теряя
+# возможность показать дашборд, а резюм переносит строки на новый run_id.
+_AUDIT_HOURS_COLUMNS = (
+    "id", "run_id", "base_url", "entity_name", "chunk_start", "chunk_end",
+    "company", "employee", "operations", "hours",
 )
 
 AUDIT_RUN_PENDING = "RUNNING"
@@ -1605,13 +1613,15 @@ def init_audit_db() -> None:
     """
     Создаёт таблицы истории аудита, если их нет (идемпотентно, WAL).
 
-    Три таблицы:
+    Четыре таблицы:
     - ``audit_runs`` — один прогон (база × период × {include_unmapped});
     - ``audit_checkpoints`` — состояние каждого (entity × месяц): старый
       комплекс COMPLETED не перечитывается при ``--resume``; RUNNING/FAILED
       перезапускаются ровно с этого чанка;
     - ``audit_gap_counts`` — счётчики нереестровых ``Document_*``
-      (только при ``--include-unmapped``).
+      (только при ``--include-unmapped``);
+    - ``audit_hours`` — агрегат (компания × сотрудник) на чанк для
+      бизнес-дашборда «Нормочасы».
     """
 
     conn = sqlite3.connect(_AUDIT_DB_PATH, timeout=30.0)
@@ -1661,10 +1671,38 @@ def init_audit_db() -> None:
             run_id INTEGER,
             doc_count INTEGER NOT NULL DEFAULT 0,
             count_available INTEGER NOT NULL DEFAULT 0,
+            count_source TEXT NOT NULL DEFAULT '',
             updated_at TEXT,
             UNIQUE (base_url, entity_name)
         )
     """)
+    cursor.execute("PRAGMA table_info(audit_gap_counts)")
+    gap_columns = {row[1] for row in cursor.fetchall()}
+    if "count_source" not in gap_columns:
+        cursor.execute(
+            "ALTER TABLE audit_gap_counts "
+            "ADD COLUMN count_source TEXT NOT NULL DEFAULT ''"
+        )
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS audit_hours (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER,
+            base_url TEXT NOT NULL,
+            entity_name TEXT NOT NULL,
+            chunk_start TEXT NOT NULL,
+            chunk_end TEXT NOT NULL,
+            company TEXT NOT NULL DEFAULT '',
+            employee TEXT NOT NULL DEFAULT '',
+            operations INTEGER NOT NULL DEFAULT 0,
+            hours REAL NOT NULL DEFAULT 0,
+            UNIQUE (base_url, entity_name, chunk_start, chunk_end,
+                    company, employee)
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_hours_run "
+        "ON audit_hours(run_id)"
+    )
 
     conn.commit()
     conn.close()
@@ -1759,5 +1797,136 @@ def list_audit_gap_counts(base_url: str) -> list[dict]:
             (base_url,),
         )
         return [_audit_row(r, _AUDIT_GAPS_COLUMNS) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def list_audit_hours(run_id: int) -> list[dict]:
+    """Сырые агрегаты нормочасов прогона (включая маркеры пустых чанков)."""
+
+    conn = _audit_conn()
+    try:
+        cursor = conn.execute(
+            "SELECT " + ", ".join(_AUDIT_HOURS_COLUMNS)
+            + " FROM audit_hours WHERE run_id = ?"
+            + " ORDER BY base_url, entity_name, chunk_start, company, employee",
+            (run_id,),
+        )
+        return [_audit_row(r, _AUDIT_HOURS_COLUMNS) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def replace_audit_hours(
+    base_url: str,
+    entity_name: str,
+    chunk_start: str,
+    chunk_end: str,
+    run_id: int,
+    rows: list[dict],
+) -> None:
+    """Заменяет снимок нормочасов одного чанка.
+
+    Пустой чанк получает маркер (``operations=0``, пустые компания/сотрудник):
+    по нему резюм отличает «уже посчитано, документов нет» от старого
+    прогона, для которого нормочасы ещё ни разу не считались.
+    """
+
+    payload = [
+        (
+            run_id, base_url, entity_name, chunk_start, chunk_end,
+            str(r.get("company") or ""), str(r.get("employee") or ""),
+            int(r.get("operations") or 0), float(r.get("hours") or 0.0),
+        )
+        for r in (rows or [])
+        if int(r.get("operations") or 0) > 0
+    ]
+    if not payload:
+        payload = [(
+            run_id, base_url, entity_name, chunk_start, chunk_end,
+            "", "", 0, 0.0,
+        )]
+
+    conn = _audit_conn()
+    try:
+        conn.execute(
+            "DELETE FROM audit_hours WHERE base_url=? AND entity_name=? "
+            "AND chunk_start=? AND chunk_end=?",
+            (base_url, entity_name, chunk_start, chunk_end),
+        )
+        conn.executemany(
+            "INSERT INTO audit_hours (run_id, base_url, entity_name, "
+            "chunk_start, chunk_end, company, employee, operations, hours) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            payload,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def reassign_audit_hours(
+    base_url: str,
+    entity_name: str,
+    chunk_start: str,
+    chunk_end: str,
+    run_id: int,
+) -> int:
+    """Переносит строки чанка на текущий прогон при резюме."""
+
+    conn = _audit_conn()
+    try:
+        cursor = conn.execute(
+            "UPDATE audit_hours SET run_id=? WHERE base_url=? "
+            "AND entity_name=? AND chunk_start=? AND chunk_end=?",
+            (run_id, base_url, entity_name, chunk_start, chunk_end),
+        )
+        conn.commit()
+        return int(cursor.rowcount)
+    finally:
+        conn.close()
+
+
+def has_audit_hours(
+    base_url: str,
+    entity_name: str,
+    chunk_start: str,
+    chunk_end: str,
+) -> bool:
+    """Есть ли для чанка посчитанный снимок нормочасов (включая маркер)."""
+
+    conn = _audit_conn()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM audit_hours WHERE base_url=? AND entity_name=? "
+            "AND chunk_start=? AND chunk_end=? LIMIT 1",
+            (base_url, entity_name, chunk_start, chunk_end),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def aggregate_audit_hours(run_id: int) -> list[dict]:
+    """Итоги прогона по компании и сотруднику (маркеры пустых чанков скрыты)."""
+
+    conn = _audit_conn()
+    try:
+        cursor = conn.execute(
+            "SELECT company, employee, SUM(operations) AS operations, "
+            "SUM(hours) AS hours FROM audit_hours WHERE run_id=? "
+            "GROUP BY company, employee HAVING SUM(operations) > 0 "
+            "ORDER BY company, employee",
+            (run_id,),
+        )
+        return [
+            {
+                "company": row[0] or "",
+                "employee": row[1] or "",
+                "operations": int(row[2] or 0),
+                "hours": round(float(row[3] or 0.0), 6),
+            }
+            for row in cursor.fetchall()
+        ]
     finally:
         conn.close()

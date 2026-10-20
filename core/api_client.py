@@ -106,6 +106,11 @@ class OneCClient:
         # Деградировавшие на минимальный $select сущности (silent-400 фолбэк).
         # Только запись: аудит читает её и помечает выгрузку как data-poor.
         self._degraded_entities: set[str] = set()
+        # Кэш типов документов из журнала операций по периоду (см.
+        # fetch_journal_document_types): журнал сканируется максимум раз.
+        self._journal_types_cache: dict[
+            tuple[str, str], dict[str, int] | None
+        ] = {}
 
     @staticmethod
     def _is_select_error(message: str) -> bool:
@@ -471,6 +476,101 @@ class OneCClient:
                 if name and etype:
                     sets[name] = etype
         return sets
+
+    def _resolve_operation_journal(self, sets: dict[str, str]) -> str | None:
+        """Имя EntitySet журнала операций (или None, если журнал не опубликован).
+
+        Сначала предпочитаем стандартный ``DocumentJournal_ЖурналОпераций``,
+        затем пробуем прочие ``DocumentJournal_*`` и оставляем первый, у
+        которого OData отдаёт поле ``Ref_Type`` (машинное имя типа документа).
+        """
+        preferred = "DocumentJournal_ЖурналОпераций"
+        if preferred in sets:
+            return preferred
+        for name in sorted(sets):
+            if not name.startswith("DocumentJournal_"):
+                continue
+            probe = f"{self.base_url}/odata/standard.odata/{name}"
+            try:
+                response = self.session.get(
+                    probe,
+                    params={"$format": "json", "$top": 1,
+                            "$select": "Ref_Type"},
+                    timeout=30,
+                )
+            except RequestException:
+                continue
+            if response.status_code == 200:
+                return name
+        return None
+
+    def fetch_journal_ref_types(
+        self,
+        period_start: str,
+        period_end: str,
+        page_size: int = 1000,
+    ) -> dict[str, int] | None:
+        """Все типы ссылок журнала операций за период.
+
+        Возвращает ``{bare_type_name: doc_count}`` для **каждого** ``Ref_Type``
+        журнала — включая типы, не начинающиеся с ``Document_`` (например,
+        ``Catalog_*``). Без фильтра: именно этот метод используется для
+        проверки покрытия («все ли записи журнала учтены аудитом»), тогда как
+        ``fetch_journal_document_types`` оставляет только ``Document_*``.
+
+        ``None`` — журнал в базе не опубликован/недоступен. Кэшируется по
+        периоду: за один прогон сети не больше одного скана.
+        """
+        cache_key = (period_start, period_end)
+        if cache_key in self._journal_types_cache:
+            return self._journal_types_cache[cache_key]
+
+        result: dict[str, int] | None = None
+        try:
+            sets = self.fetch_metadata_entity_sets()
+            journal = self._resolve_operation_journal(sets)
+            if journal is not None:
+                fields = ["Date", "Ref", "Ref_Type", "Posted"]
+                endpoint, params = self._documents_request(
+                    journal, period_start, period_end, fields, page_size
+                )
+                counts: dict[str, int] = {}
+                for page in self._paginate_pages(endpoint, params, pause=0.0):
+                    for rec in page.get("value", []):
+                        name = str(rec.get("Ref_Type") or "").strip()
+                        if not name:
+                            continue
+                        bare = name.rsplit(".", 1)[-1]
+                        counts[bare] = counts.get(bare, 0) + 1
+                result = counts
+        except (ValueError, KeyError, TypeError):
+            result = None
+
+        self._journal_types_cache[cache_key] = result
+        return result
+
+    def fetch_journal_document_types(
+        self,
+        period_start: str,
+        period_end: str,
+        page_size: int = 1000,
+    ) -> dict[str, int] | None:
+        """Типы документов из журнала операций за период.
+
+        Возвращает ``{entity_name: doc_count}`` только для ``Document_*`` или
+        ``None``, если журнал в базе не опубликован/недоступен. Это дешёвая
+        альтернатива перебору сотен ``Document_*`` из ``$metadata``:
+        ``Ref_Type`` содержит машинное имя типа
+        (``StandardODATA.Document_РеализацияТоваровУслуг``), а строки журнала
+        соответствуют документам, включая непроведённые. Типы вне
+        ``Document_*`` смотрите в ``fetch_journal_ref_types``.
+        """
+        refs = self.fetch_journal_ref_types(
+            period_start, period_end, page_size=page_size
+        )
+        if refs is None:
+            return None
+        return {k: v for k, v in refs.items() if k.startswith("Document_")}
 
     def fetch_metadata_entity_properties(self) -> dict[str, dict[str, set[str]]]:
         """Fetch and parse OData $metadata to extract EntityType properties.

@@ -23,6 +23,12 @@ _BASE = {
     "password": "secret",
 }
 
+_JOURNAL_ENTITY_SET = (
+    '<EntitySet Name="DocumentJournal_ЖурналОпераций" '
+    'EntityType="StandardODATA.DocumentJournal_ЖурналОпераций"/>'
+)
+
+
 _METADATA_XML = (
     '<?xml version="1.0" encoding="utf-8"?>'
     '<edmx:Edmx xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx" Version="1.0">'
@@ -72,27 +78,46 @@ class _FakeData:
         self.entities: dict[str, dict] = {}  # entity -> {"rows": int,
         # "sum": float, "count": int|None, "fail": str|None, "degrade": bool}
         self.calls = 0
+        self.journal: list[dict] | None = None
+
+    def set_journal(self, records: list[dict]) -> None:
+        """Публикует журнал операций с указанными строками."""
+
+        self.journal = records
 
     def set_entity(self, name, *, rows=0, sum=0.0, count=None, fail=None,
-                   degrade=False, not_found=False):
+                   degrade=False, not_found=False, records=None):
         self.entities[name] = {
             "rows": rows, "sum": sum, "count": count, "fail": fail,
-            "degrade": degrade, "not_found": not_found,
+            "degrade": degrade, "not_found": not_found, "records": records,
         }
+
+    def _metadata(self) -> bytes:
+        xml = _METADATA_XML.decode("utf-8")
+        if self.journal is not None:
+            xml = xml.replace(
+                "</EntityContainer>",
+                _JOURNAL_ENTITY_SET + "</EntityContainer>",
+            )
+        return xml.encode("utf-8")
 
     def fake_get(self, url, params=None, timeout=None):
         self.calls += 1
         self.requests_seen.append(url)
         if "/$metadata" in url:
-            return _FakeResponse(content=_METADATA_XML)
+            return _FakeResponse(content=self._metadata())
         entity = "?" if "/odata/standard.odata/" not in url else url.split(
             "/odata/standard.odata/", 1)[1].split("?", 1)[0]
+        if entity.startswith("DocumentJournal_"):
+            if self.journal is None:
+                return _FakeResponse(None, 404)
+            return _FakeResponse({"value": self.journal})
         spec = self.entities.get(entity)
         if spec is None:
             return _FakeResponse({"value": []}, 200)
         if spec["not_found"]:
             return _FakeResponse(None, 404)
-        if "count=true" in url:
+        if "inlinecount=allpages" in url:
             if spec["count"] is None:
                 return _FakeResponse({"value": []}, 400)
             return _FakeResponse(
@@ -105,8 +130,11 @@ class _FakeData:
             fields = parse_qs(url.split("?", 1)[1]).get("$select", [""])[0]
             if len(fields.split(",")) > 3:
                 return _FakeResponse(None, 400)
-        rows = [_row(spec["sum"] / spec["rows"] if spec["rows"] else 0.0,
-                     f"{entity}#{i}") for i in range(spec["rows"])]
+        if spec.get("records") is not None:
+            rows = spec["records"]
+        else:
+            rows = [_row(spec["sum"] / spec["rows"] if spec["rows"] else 0.0,
+                         f"{entity}#{i}") for i in range(spec["rows"])]
         return _FakeResponse({"value": rows})
 
 
@@ -191,6 +219,149 @@ def test_run_audit_completes_and_count_matches():
     assert cp["count_mismatch"] == 0
     assert cp["degraded"] == 0
     assert cp["page_count"] == 1
+
+
+def test_run_audit_aggregates_business_hours(monkeypatch):
+    """Аудит сам считает нормочасы по компании/сотруднику, как отчёт."""
+    monkeypatch.setattr(
+        audit, "load_doc_types",
+        lambda: {"doc_a": {"entity": "Document_A", "title": "Реализация"}},
+    )
+    db.upsert_norm(
+        "doc_a", "Тест", "Реализация", "Document_A",
+        norm_hours=0.5, coeff=2.0,
+    )
+    db.upsert_employee("Иванова Елена", role="бухгалтер")
+    db.insert_base(_BASE["name"], _BASE["url"], _BASE["login"], _BASE["password"])
+
+    fake = _FakeData()
+    fake.set_entity(
+        "Document_A", rows=3, sum=30.0, count=3,
+        records=[
+            {"Ref_Key": "1", "СуммаДокумента": 10.0,
+             "Организация_Key": "org-1", "Ответственный_Key": "user-1"},
+            {"Ref_Key": "2", "СуммаДокумента": 10.0,
+             "Организация_Key": "org-1", "Ответственный_Key": "user-1"},
+            {"Ref_Key": "3", "СуммаДокумента": 10.0,
+             "Организация_Key": "org-2", "Ответственный_Key": "user-2"},
+        ],
+    )
+    fc = _FakeClient(fake)
+    fc.client._catalogs_loaded = True
+    fc.client._organizations = {
+        "org-1": {"name": "ООО Ромашка", "inn": ""},
+        "org-2": {"name": "ООО Лютик", "inn": ""},
+    }
+    fc.client._guid_to_name = {"user-1": "Иванова Елена", "user-2": "Неизвестный"}
+
+    summary = audit.run_audit(
+        _BASE, "2026-01-01", "2026-01-31",
+        client=fc.client, pause=0.0,
+    )
+    assert summary["run_status"] == db.AUDIT_RUN_COMPLETED
+
+    rows = audit.audit_hours_summary(_BASE["name"])
+    by_key = {(r["company"], r["employee"]): r for r in rows}
+    assert by_key[("ООО Ромашка", "Иванова Елена")]["operations"] == 2
+    assert by_key[("ООО Ромашка", "Иванова Елена")]["hours"] == 2.0
+    assert by_key[("ООО Лютик", "Не распределено")]["operations"] == 1
+    assert by_key[("ООО Лютик", "Не распределено")]["hours"] == 1.0
+
+
+def test_audit_hours_backfilled_for_old_completed_chunk(monkeypatch):
+    """Старый COMPLETED-чанк без audit_hours перечитывается один раз."""
+    registry = {
+        "doc_a": {"entity": "Document_A", "title": "Реализация"},
+    }
+    monkeypatch.setattr(audit, "load_doc_types", lambda: registry)
+    db.upsert_norm(
+        "doc_a", "Тест", "Реализация", "Document_A", norm_hours=1.0,
+    )
+    db.upsert_employee("Иванова Елена")
+
+    fake = _FakeData()
+    fake.set_entity("Document_A", rows=1, sum=10.0, count=1)
+    fc = _FakeClient(fake)
+    fc.client._catalogs_loaded = True
+    fc.client._organizations = {"org-1": {"name": "ООО Ромашка", "inn": ""}}
+    fc.client._guid_to_name = {"user-1": "Иванова Елена"}
+    fake.entities["Document_A"]["records"] = [{
+        "Ref_Key": "1", "СуммаДокумента": 10.0,
+        "Организация_Key": "org-1", "Ответственный_Key": "user-1",
+    }]
+
+    first = audit.run_audit(
+        _BASE, "2026-01-01", "2026-01-31",
+        client=fc.client, pause=0.0,
+        entities=["Document_A"],
+    )
+    assert db.aggregate_audit_hours(first["run_id"])
+
+    conn = db._audit_conn()
+    try:
+        conn.execute("DELETE FROM audit_hours")
+        conn.commit()
+    finally:
+        conn.close()
+
+    n_before = fake.calls
+    second = audit.run_audit(
+        _BASE, "2026-01-01", "2026-01-31",
+        client=fc.client, pause=0.0,
+        entities=["Document_A"],
+    )
+    assert second["chunks_completed"] == 1
+    assert second["chunks_skipped"] == 0
+    assert fake.calls > n_before
+    assert db.aggregate_audit_hours(second["run_id"])[0]["operations"] == 1
+
+
+def test_run_audit_routes_variant_to_its_norm(monkeypatch):
+    registry = {
+        "doc_a": {
+            "entity": "Document_A", "title": "Авансовый отчёт",
+            "variant_rules": [{"terms": ["гсм"], "to": "doc_a_fuel"}],
+        },
+        "doc_a_fuel": {
+            "entity": "Document_A", "title": "Авансовый отчёт (ГСМ)",
+        },
+    }
+    monkeypatch.setattr(audit, "load_doc_types", lambda: registry)
+    db.upsert_norm(
+        "doc_a", "Тест", "Авансовый отчёт", "Document_A", norm_hours=1.0,
+    )
+    db.upsert_norm(
+        "doc_a_fuel", "Тест", "Авансовый отчёт (ГСМ)", "Document_A",
+        norm_hours=3.0,
+    )
+    db.upsert_employee("Иванова Елена")
+    db.insert_base(_BASE["name"], _BASE["url"], _BASE["login"], _BASE["password"])
+
+    fake = _FakeData()
+    fake.set_entity(
+        "Document_A", rows=2, sum=20.0, count=2,
+        records=[
+            {"Ref_Key": "1", "СуммаДокумента": 10.0,
+             "Организация_Key": "org-1", "Ответственный_Key": "user-1",
+             "ВидОперации": "ГСМ"},
+            {"Ref_Key": "2", "СуммаДокумента": 10.0,
+             "Организация_Key": "org-1", "Ответственный_Key": "user-1",
+             "ВидОперации": "Обычный"},
+        ],
+    )
+    fc = _FakeClient(fake)
+    fc.client._catalogs_loaded = True
+    fc.client._organizations = {"org-1": {"name": "ООО Ромашка", "inn": ""}}
+    fc.client._guid_to_name = {"user-1": "Иванова Елена"}
+
+    summary = audit.run_audit(
+        _BASE, "2026-01-01", "2026-01-31",
+        client=fc.client, pause=0.0,
+    )
+    rows = audit.audit_hours_summary(_BASE["name"])
+    assert len(rows) == 1
+    assert rows[0]["operations"] == 2
+    assert rows[0]["hours"] == 4.0
 
 
 def test_run_audit_multiple_entities_two_months():
@@ -471,6 +642,203 @@ def test_gaps_without_flag_skips_metadata():
     assert not any("/$metadata" in u for u in fake.requests_seen)
 
 
+def _journal_row(entity: str, ref: str = "r") -> dict:
+    return {
+        "Ref": ref,
+        "Ref_Type": f"StandardODATA.{entity}",
+        "Date": "2026-01-10T00:00:00",
+        "Posted": True,
+    }
+
+
+def test_count_records_uses_inlinecount_not_v4_count():
+    """1С:Фреш отвечает 501 на $count=true — сверка идёт через $inlinecount."""
+    fake = _FakeData()
+    fake.set_entity("Document_A", rows=0, count=4)
+    fc = _FakeClient(fake)
+
+    total, available = audit._count_records(
+        fc.client, "Document_A", "2026-01-01", "2026-01-31"
+    )
+
+    assert (total, available) == (4, True)
+    assert any("inlinecount=allpages" in u for u in fake.requests_seen)
+    assert not any("count=true" in u for u in fake.requests_seen)
+
+
+def test_journal_gap_source_counts_types_without_metadata_sweep():
+    fake = _FakeData()
+    fake.set_entity("Document_ПлатежноеПоручение", rows=0, count=2)
+    fake.set_journal([
+        _journal_row("Document_ПлатежноеПоручение"),
+        _journal_row("Document_НеРеестровое"),
+        _journal_row("Document_НеРеестровое"),
+        _journal_row("Catalog_Контрагенты"),
+    ])
+    fc = _FakeClient(fake)
+
+    summary = audit.run_audit(
+        _BASE, "2026-01-01", "2026-01-31",
+        client=fc.client, pause=0.0, include_unmapped=True,
+        entities=["Document_ПлатежноеПоручение"],
+    )
+
+    assert summary["gap_source"] == "journal"
+    assert summary["gaps_count"] == 1
+    gaps = db.list_audit_gap_counts(_BASE["url"])
+    assert [
+        (g["entity_name"], g["doc_count"], g["count_source"]) for g in gaps
+    ] == [("Document_НеРеестровое", 2, "journal")]
+
+    # Журнал заменил перебор $metadata-счётчиков по нереестровым сущностям.
+    assert not any(
+        "Document_НеРеестровое" in u for u in fake.requests_seen
+    )
+
+
+def test_journal_available_but_empty_yields_zero_gaps_without_sweep():
+    fake = _FakeData()
+    fake.set_entity("Document_ПлатежноеПоручение", rows=0, count=1)
+    fake.set_journal([])
+    fc = _FakeClient(fake)
+    conn = db._audit_conn()
+    try:
+        conn.execute(
+            "INSERT INTO audit_gap_counts (base_url, entity_name, doc_count) "
+            "VALUES (?, 'Document_Старое', 9)",
+            (_BASE["url"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    summary = audit.run_audit(
+        _BASE, "2026-01-01", "2026-01-31",
+        client=fc.client, pause=0.0, include_unmapped=True,
+        entities=["Document_ПлатежноеПоручение"],
+    )
+
+    assert summary["gap_source"] == "journal"
+    assert summary["gaps_count"] == 0
+    # Снимок текущего прогона: старые строки не залипают.
+    assert db.list_audit_gap_counts(_BASE["url"]) == []
+    assert not any(
+        "Document_НеРеестровое" in u for u in fake.requests_seen
+    )
+
+
+def test_gap_source_journal_unavailable_warns_and_skips(capsys):
+    fake = _FakeData()
+    fake.set_entity("Document_ПлатежноеПоручение", rows=0, count=1)
+    fake.set_entity("Document_НеРеестровое", rows=0, count=7)
+    fc = _FakeClient(fake)
+
+    summary = audit.run_audit(
+        _BASE, "2026-01-01", "2026-01-31",
+        client=fc.client, pause=0.0, include_unmapped=True,
+        entities=["Document_ПлатежноеПоручение"], gap_source="journal",
+    )
+
+    assert summary["gap_source"] == "none"
+    assert summary["gaps_count"] == 0
+    assert "Журнал операций недоступен" in capsys.readouterr().err
+    assert db.list_audit_gap_counts(_BASE["url"]) == []
+
+
+def test_gap_source_metadata_forces_sweep_even_with_journal():
+    fake = _FakeData()
+    fake.set_entity("Document_ПлатежноеПоручение", rows=0, count=1)
+    fake.set_entity("Document_НеРеестровое", rows=0, count=7)
+    fake.set_journal([_journal_row("Document_НеРеестровое")])
+    fc = _FakeClient(fake)
+
+    summary = audit.run_audit(
+        _BASE, "2026-01-01", "2026-01-31",
+        client=fc.client, pause=0.0, include_unmapped=True,
+        entities=["Document_ПлатежноеПоручение"], gap_source="metadata",
+    )
+
+    assert summary["gap_source"] == "metadata"
+    gaps = db.list_audit_gap_counts(_BASE["url"])
+    assert gaps[0]["doc_count"] == 7
+    assert gaps[0]["count_source"] == "inlinecount"
+    assert not any("DocumentJournal_" in u for u in fake.requests_seen)
+
+
+def test_verify_journal_coverage_classifies_sources(monkeypatch):
+    """Реестр — поштучно, нереестровые Document_* — gaps, прочее — дыра."""
+    monkeypatch.setattr(
+        audit, "load_doc_types",
+        lambda: {"doc_a": {"entity": "Document_A", "title": "A"}},
+    )
+    fake = _FakeData()
+    fake.set_journal([
+        _journal_row("Document_A"),
+        _journal_row("Document_НеРеестровое"),
+        _journal_row("Document_НеРеестровое"),
+        _journal_row("Catalog_Контрагенты"),
+    ])
+    fc = _FakeClient(fake)
+
+    report = audit.verify_journal_coverage(
+        _BASE, "2026-01-01", "2026-01-31", client=fc.client
+    )
+
+    assert report["available"] is True
+    assert report["total"] == 4
+    assert report["covered"] == 3
+    assert report["coverage"] == 0.75
+    assert report["uncovered"] == ["Catalog_Контрагенты"]
+    by_type = {e["type"]: e["covered_by"] for e in report["types"]}
+    assert by_type == {
+        "Document_A": "registry",
+        "Document_НеРеестровое": "gap",
+        "Catalog_Контрагенты": "uncovered",
+    }
+
+
+def test_verify_journal_coverage_counts_manual_and_routine(monkeypatch):
+    """Ручные и регламентные операции выделяются отдельными счётчиками."""
+    monkeypatch.setattr(
+        audit, "load_doc_types",
+        lambda: {
+            "manual": {"entity": "Document_ОперацияБух", "title": "Операция"},
+        },
+    )
+    fake = _FakeData()
+    fake.set_journal([
+        _journal_row("Document_ОперацияБух"),
+        _journal_row("Document_РегламентнаяОперация"),
+        _journal_row("Document_РегламентнаяОперация"),
+    ])
+    fc = _FakeClient(fake)
+
+    report = audit.verify_journal_coverage(
+        _BASE, "2026-01-01", "2026-01-31", client=fc.client
+    )
+
+    assert report["manual"] == 1
+    assert report["routine"] == 2
+    assert report["coverage"] == 1.0
+    by_type = {e["type"]: e["covered_by"] for e in report["types"]}
+    assert by_type["Document_ОперацияБух"] == "registry"
+    assert by_type["Document_РегламентнаяОперация"] == "gap"
+
+
+def test_verify_journal_coverage_unavailable():
+    """Без журнала операций покрытие не проверяется (available=False)."""
+    fake = _FakeData()  # журнал не опубликован
+    fc = _FakeClient(fake)
+
+    report = audit.verify_journal_coverage(
+        _BASE, "2026-01-01", "2026-01-31", client=fc.client
+    )
+
+    assert report["available"] is False
+    assert report["coverage"] is None
+    assert "недоступен" in audit.format_journal_coverage(report)
+
+
 # ============================= ПАУЗЫ ========================================
 
 def test_pause_applied_between_count_and_gap_requests(monkeypatch):
@@ -528,6 +896,29 @@ def test_write_audit_report_three_sheets(tmp_path):
     ]
     assert "Document_A" in problem_entities
     assert "Document_B" not in problem_entities
+
+
+def test_gaps_sheet_reports_count_source(tmp_path):
+    fake = _FakeData()
+    fake.set_entity("Document_ПлатежноеПоручение", rows=0, count=1)
+    fake.set_entity("Document_НеРеестровое", rows=0, count=5)
+    fc = _FakeClient(fake)
+
+    summary = audit.run_audit(
+        _BASE, "2026-01-01", "2026-01-31",
+        client=fc.client, pause=0.0, include_unmapped=True,
+        entities=["Document_ПлатежноеПоручение"],
+    )
+    path = audit.write_audit_report(summary, out_dir=str(tmp_path))
+    wb = openpyxl.load_workbook(path)
+
+    assert [c.value for c in wb["Gaps"][1]] == [
+        "Сущность", "Количество документов", "Источник",
+    ]
+    assert [c.value for c in wb["Gaps"][2]] == [
+        "Document_НеРеестровое", 5, "$inlinecount",
+    ]
+    assert "$inlinecount" in [c.value for c in wb["Сводка"][1]]
 
 
 def test_main_unknown_base_returns_2(capsys):
@@ -603,6 +994,57 @@ def test_main_requires_period_unless_listing():
     """Без --list-bases период обязателен (argparse завершает с кодом 2)."""
     with pytest.raises(SystemExit) as exc:
         audit.main(["--base", "что угодно"])
+    assert exc.value.code == 2
+
+
+def _coverage_report(uncovered):
+    return {
+        "available": True, "base_name": "Покрытие Тест",
+        "base_url": "https://c.example/a/1",
+        "period_start": "2026-01-01", "period_end": "2026-01-31",
+        "total": 3, "covered": 3 - len(uncovered),
+        "coverage": (3 - len(uncovered)) / 3, "manual": 0, "routine": 0,
+        "types": [], "uncovered": uncovered,
+    }
+
+
+def test_main_verify_coverage_returns_0_when_covered(monkeypatch, capsys):
+    db.insert_base("Покрытие Тест", "https://c.example/a/1", "u", "p")
+    monkeypatch.setattr(
+        audit, "verify_journal_coverage", lambda *a, **k: _coverage_report([])
+    )
+
+    rc = audit.main([
+        "--verify-coverage", "--base", "Покрытие Тест",
+        "--start", "2026-01-01", "--end", "2026-01-31",
+    ])
+
+    assert rc == 0
+    assert "все записи журнала учтены" in capsys.readouterr().out
+
+
+def test_main_verify_coverage_returns_1_on_hole(monkeypatch, capsys):
+    db.insert_base("Покрытие Дыра", "https://c.example/a/2", "u", "p")
+    monkeypatch.setattr(
+        audit, "verify_journal_coverage",
+        lambda *a, **k: _coverage_report(["Catalog_X"]),
+    )
+
+    rc = audit.main([
+        "--verify-coverage", "--base", "Покрытие Дыра",
+        "--start", "2026-01-01", "--end", "2026-01-31",
+    ])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "дыры покрытия" in captured.out
+    assert "Catalog_X" in captured.out
+    assert "баз с дырами" in captured.err
+
+
+def test_main_verify_coverage_requires_period():
+    with pytest.raises(SystemExit) as exc:
+        audit.main(["--verify-coverage", "--base", "что угодно"])
     assert exc.value.code == 2
 
 
@@ -772,3 +1214,91 @@ def test_default_out_dir_prefers_data_volume(monkeypatch):
 
     monkeypatch.setattr(audit, "Path", _NoData)
     assert audit._default_out_dir() == "exports"
+
+
+# ============================ ПАКЕТНЫЙ ОБХОД ================================
+
+def _minimal_summary(base_name: str, base_url: str) -> dict:
+    return {
+        "base_name": base_name, "base_url": base_url,
+        "period_start": "2026-01-01", "period_end": "2026-01-31",
+        "run_id": 1, "chunks_total": 1, "chunks_completed": 1,
+        "chunks_skipped": 0, "chunks_failed": 0, "count_mismatches": 0,
+        "degraded_entities": [], "gaps_count": None,
+    }
+
+
+def test_main_all_bases_loops_active(monkeypatch, capsys):
+    db.insert_base("Пакет А", "https://batch.example/a/1", "u", "p")
+    db.insert_base("Пакет Б", "https://batch.example/a/2", "u", "p")
+    db.insert_base("Пакет Неактивная", "https://batch.example/a/3", "u", "p",
+                   active=False)
+    calls = []
+
+    def _fake(base, start, end, **kw):
+        calls.append((base["name"], start, end))
+        return _minimal_summary(base["name"], base["url"])
+
+    monkeypatch.setattr(audit, "run_audit", _fake)
+    monkeypatch.setattr(
+        audit, "write_audit_report", lambda s, out_dir=None: "/tmp/r.xlsx"
+    )
+    rc = audit.main(
+        ["--all-bases", "--start", "2026-01-01", "--end", "2026-01-31"]
+    )
+    assert rc == 0
+    assert {c[0] for c in calls} == {"Пакет А", "Пакет Б"}
+    assert all(c[1] == "2026-01-01" and c[2] == "2026-01-31" for c in calls)
+    out = capsys.readouterr().out
+    assert "[1/2]" in out and "[2/2]" in out
+    assert "Пакетный аудит завершён" in out
+
+
+def test_main_all_bases_continues_after_failure(monkeypatch, capsys):
+    db.insert_base("Пакет Сбой", "https://batch2.example/a/1", "u", "p")
+    db.insert_base("Пакет Успех", "https://batch2.example/a/2", "u", "p")
+
+    def _fake(base, start, end, **kw):
+        if "Сбой" in base["name"]:
+            raise ValueError("сломанная база")
+        return _minimal_summary(base["name"], base["url"])
+
+    monkeypatch.setattr(audit, "run_audit", _fake)
+    monkeypatch.setattr(
+        audit, "write_audit_report", lambda s, out_dir=None: "/tmp/r.xlsx"
+    )
+    rc = audit.main(
+        ["--all-bases", "--start", "2026-01-01", "--end", "2026-01-31"]
+    )
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "Пропущено" in captured.err
+    assert "с ошибками 1" in captured.out
+
+
+def test_main_base_and_all_bases_mutually_exclusive():
+    with pytest.raises(SystemExit) as exc:
+        audit.main([
+            "--base", "что угодно", "--all-bases",
+            "--start", "2026-01-01", "--end", "2026-01-31",
+        ])
+    assert exc.value.code == 2
+
+
+def test_main_busy_lock_returns_3(capsys):
+    import fcntl
+
+    from core import config
+
+    fd = os.open(config.AUDIT_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        rc = audit.main([
+            "--base", "что угодно",
+            "--start", "2026-01-01", "--end", "2026-01-31",
+        ])
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    assert rc == 3
+    assert "уже выполняется" in capsys.readouterr().err

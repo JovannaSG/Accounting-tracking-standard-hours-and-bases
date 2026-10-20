@@ -3,9 +3,12 @@ import pytest
 
 from core import db
 from core.calculator import (
-    build_report,
+    apply_norms_and_employees,
     build_employee_load,
+    build_norm_index,
+    build_report,
     find_missing_norms,
+    resolve_business_row,
     summarize_totals,
 )
 
@@ -70,6 +73,28 @@ def test_build_report_sums_hours(with_norms_and_employees):
     assert totals["total_operations"] == 3
     assert totals["total_hours"] == pytest.approx(0.33)
     assert totals["by_client"]["ООО Альфа"]["operations"] == 3
+
+
+def test_shared_business_resolver_matches_report(with_norms_and_employees):
+    """Аудит и отчёт используют одну формулу нормочасов."""
+    by_title = build_norm_index()
+    employees = db.list_employees(active_only=True)
+
+    business = resolve_business_row(
+        "Иванова А.А.", "Авансовый отчет", 2, by_title, employees
+    )
+    assert business["full_name"] == "Иванова Анна"
+    assert business["hours"] == pytest.approx(0.5)
+
+    raw = _df([
+        _row(**{"Вид документа": "Авансовый отчет",
+                "Количество операций": 2}),
+    ])
+    prepared = apply_norms_and_employees(raw)
+    assert prepared.iloc[0]["Ответственный сотрудник"] == "Иванова Анна"
+    assert prepared.iloc[0]["Трудозатраты, нормочасы"] == pytest.approx(
+        business["hours"]
+    )
 
 
 def test_report_keeps_sno_and_inn_columns(with_norms_and_employees):

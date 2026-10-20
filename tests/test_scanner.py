@@ -36,6 +36,15 @@ def _reload_config_with(env_value: str | None) -> None:
     importlib.reload(config)
 
 
+def _reload_audit_flag_with(env_value: str | None) -> None:
+    """Перечитывает config с заданным ENABLE_AUDIT_DASHBOARD."""
+    if env_value is None:
+        os.environ.pop("ENABLE_AUDIT_DASHBOARD", None)
+    else:
+        os.environ["ENABLE_AUDIT_DASHBOARD"] = env_value
+    importlib.reload(config)
+
+
 @pytest.fixture
 def clean_db():
     """Пустая тестовая БД (conftest чистит файл между тестами)."""
@@ -74,6 +83,20 @@ def test_core_config_parses_and_exposes_flags():
 def test_scanner_flag_defaults_to_off():
     _reload_config_with(None)
     assert config.ENABLE_REGISTRY_SCANNER is False
+
+
+def test_audit_dashboard_flag_defaults_to_on():
+    """ENABLE_AUDIT_DASHBOARD включён по умолчанию (вкладка «Аудит» у админа).
+
+    Регрессия: вкладка должна появляться «из коробки», без правки .env
+    (приложение .env не читает — только core/config.py и env процесса).
+    """
+    original = os.environ.get("ENABLE_AUDIT_DASHBOARD")
+    _reload_audit_flag_with(None)
+    try:
+        assert config.ENABLE_AUDIT_DASHBOARD is True
+    finally:
+        _reload_audit_flag_with(original)
 
 
 def test_scanner_flag_env_override():

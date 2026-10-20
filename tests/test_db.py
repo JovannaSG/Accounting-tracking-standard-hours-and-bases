@@ -917,16 +917,16 @@ def test_upsert_employee_idempotent_does_not_create_users(clean_db):
 # ============================ ИСТОРИЯ АУДИТА ================================
 
 def test_init_audit_db_creates_tables_idempotent(monkeypatch):
-    """init_audit_db(): три таблицы, повторные вызовы не меняют схему."""
+    """init_audit_db(): четыре таблицы, повторные вызовы не меняют схему."""
     tmp = tempfile.mkdtemp(prefix="audit_db_")
     path = os.path.join(tmp, "audit.db")
     monkeypatch.setattr(db, "_AUDIT_DB_PATH", path)
 
     db.init_audit_db()
     before = _schema_snapshot(path)
-    assert {"audit_runs", "audit_checkpoints", "audit_gap_counts"} <= set(
-        before
-    ), f"ожидались все аудит-таблицы, есть: {sorted(before)}"
+    assert {
+        "audit_runs", "audit_checkpoints", "audit_gap_counts", "audit_hours",
+    } <= set(before), f"ожидались все аудит-таблицы, есть: {sorted(before)}"
 
     db.init_audit_db()
     db.init_audit_db()
@@ -961,6 +961,40 @@ def test_audit_checkpoints_unique_per_chunk(monkeypatch):
         conn.close()
 
 
+def test_init_audit_db_migrates_gap_count_source(monkeypatch):
+    """Старая audit_gap_counts без count_source мигрирует через ALTER TABLE."""
+    tmp = tempfile.mkdtemp(prefix="audit_migrate_")
+    path = os.path.join(tmp, "audit.db")
+    monkeypatch.setattr(db, "_AUDIT_DB_PATH", path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE audit_gap_counts (id INTEGER PRIMARY KEY "
+            "AUTOINCREMENT, base_url TEXT NOT NULL, entity_name TEXT NOT NULL, "
+            "run_id INTEGER, doc_count INTEGER NOT NULL DEFAULT 0, "
+            "count_available INTEGER NOT NULL DEFAULT 0, updated_at TEXT, "
+            "UNIQUE (base_url, entity_name))"
+        )
+        conn.execute(
+            "INSERT INTO audit_gap_counts (base_url, entity_name, doc_count) "
+            "VALUES ('https://b.example/a/1', 'Document_X', 3)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    db.init_audit_db()
+
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute(
+            "SELECT count_source FROM audit_gap_counts"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == ("",)
+
+
 def test_audit_gap_counts_unique_per_entity(monkeypatch):
     tmp = tempfile.mkdtemp(prefix="audit_gap_uniq_")
     path = os.path.join(tmp, "audit.db")
@@ -983,6 +1017,60 @@ def test_audit_gap_counts_unique_per_entity(monkeypatch):
             )
     finally:
         conn.close()
+
+
+def test_audit_hours_snapshot_marker_and_reassign(monkeypatch):
+    """audit_hours: снимок чанка, маркер пустого чанка, перенос на run."""
+    tmp = tempfile.mkdtemp(prefix="audit_hours_")
+    path = os.path.join(tmp, "audit.db")
+    monkeypatch.setattr(db, "_AUDIT_DB_PATH", path)
+    db.init_audit_db()
+
+    base = "https://b.example/a/1"
+    db.replace_audit_hours(
+        base, "Document_A", "2026-01-01", "2026-01-31", 1,
+        [
+            {"company": "ООО Ромашка", "employee": "Иванова",
+             "operations": 2, "hours": 1.5},
+            {"company": "ООО Лютик", "employee": "Петров",
+             "operations": 1, "hours": 0.5},
+        ],
+    )
+    assert db.has_audit_hours(
+        base, "Document_A", "2026-01-01", "2026-01-31"
+    )
+    assert len(db.aggregate_audit_hours(1)) == 2
+
+    # Пустой чанк получает маркер, который не показывается в агрегате.
+    db.replace_audit_hours(
+        base, "Document_A", "2026-02-01", "2026-02-28", 1, []
+    )
+    marker = [
+        r for r in db.list_audit_hours(1)
+        if r["chunk_start"] == "2026-02-01"
+    ]
+    assert len(marker) == 1
+    assert marker[0]["operations"] == 0
+    assert len(db.aggregate_audit_hours(1)) == 2
+
+    # Резюм переносит существующий снимок на новый run_id.
+    assert db.reassign_audit_hours(
+        base, "Document_A", "2026-01-01", "2026-01-31", 2
+    ) == 2
+    assert db.aggregate_audit_hours(1) == []
+    assert len(db.aggregate_audit_hours(2)) == 2
+
+    # Повторный расчёт заменяет снимок чанка, а не накапливает строки.
+    db.replace_audit_hours(
+        base, "Document_A", "2026-01-01", "2026-01-31", 2,
+        [{"company": "ООО Новое", "employee": "Сидоров",
+          "operations": 5, "hours": 3.0}],
+    )
+    rows = db.aggregate_audit_hours(2)
+    assert rows == [{
+        "company": "ООО Новое", "employee": "Сидоров",
+        "operations": 5, "hours": 3.0,
+    }]
 
 
 def test_list_audit_runs_orders_by_id_desc(monkeypatch):

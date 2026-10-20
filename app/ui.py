@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import time
+from datetime import date
 
 import pandas as pd
 import streamlit as st
@@ -11,7 +12,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from core import auth, config, db
+from core import audit, audit_runner, auth, config, db
 from core.api_client import OneCClient
 from core.norms import load_doc_types, seed_default_norms, DEFAULT_NORMS_HOURS
 from core.fetch import fetch_documents, unmapped_user_names
@@ -1567,6 +1568,326 @@ def _employee_full_names() -> list[str]:
     return [e["full_name"] for e in db.list_employees(active_only=True)]
 
 
+# Цвета подсветки строк дашборда аудита.
+_AUDIT_OK_COLOR = "#d4edda"
+_AUDIT_PROBLEM_COLOR = "#f8d7da"
+_AUDIT_RUNNING_COLOR = "#fff3cd"
+
+# Статусы прогона аудита (значения core.db.AUDIT_RUN_*).
+_AUDIT_STATUS_LABELS = {
+    "RUNNING": "выполняется",
+    "COMPLETED": "завершён",
+    "FAILED": "ошибка",
+}
+
+
+def _audit_scope_label(scope: object) -> str:
+    return {
+        "all": "все базы",
+        "single": "одна база",
+    }.get(str(scope or ""), "запуск")
+
+
+def _audit_period_label(row: dict) -> str:
+    if row.get("period_start") and row.get("period_end"):
+        return f"{row['period_start']}…{row['period_end']}"
+    return "—"
+
+
+def _audit_summary_table(rows: list[dict]):
+    """DataFrame сводки аудита с построчной подсветкой проблем.
+
+    Красный — расхождение/ошибка, жёлтый — идёт прогон, зелёный — чисто.
+    """
+
+    view = pd.DataFrame([
+        {
+            "База": r["base_name"],
+            "Статус": _AUDIT_STATUS_LABELS.get(str(r.get("run_status")), "—"),
+            "Период": _audit_period_label(r),
+            "Чанки (готово/всего)": f"{r['chunks_done']}/{r['chunks_total']}",
+            "Пусто": r["chunks_empty"],
+            "Ошибок": r["chunks_failed"],
+            "Строк": r["rows_total"],
+            "Сумма": r["sum_total"],
+            "Расхождений": r["mismatches"],
+            "Gaps": r["gaps_count"],
+            "Проблем": r["problems"],
+        }
+        for r in rows
+    ])
+    problem = pd.Series(
+        [bool(r["has_problems"]) or str(r.get("run_status")) == "FAILED"
+         for r in rows],
+        index=view.index,
+    )
+    running = pd.Series(
+        [str(r.get("run_status")) == "RUNNING" for r in rows],
+        index=view.index,
+    )
+
+    def _row_color(row):
+        if running.loc[row.name]:
+            color = _AUDIT_RUNNING_COLOR
+        elif problem.loc[row.name]:
+            color = _AUDIT_PROBLEM_COLOR
+        else:
+            color = _AUDIT_OK_COLOR
+        # Цвет текста задаём явно: без него Streamlit берёт цвет активной
+        # темы, и под тёмной темой браузера строки стали бы белыми на бледной
+        # подложке. Тёмный текст читается и на светлой, и на тёмной теме.
+        return [f"background-color: {color}; color: #1c1e21"] * len(row)
+
+    return view.style.apply(_row_color, axis=1)
+
+
+def _audit_hours_table(rows: list[dict], show_base: bool):
+    """Бизнес-сводка аудита: компания / сотрудник / нормочасы."""
+
+    data = []
+    for r in rows:
+        item = {}
+        if show_base:
+            item["База"] = r["base_name"]
+        item.update({
+            "Период": _audit_period_label(r),
+            "Компания": r.get("company") or "—",
+            "Сотрудник": r.get("employee") or "Не распределено",
+            "Операций": int(r.get("operations") or 0),
+            "Нормочасы": round(float(r.get("hours") or 0.0), 2),
+        })
+        data.append(item)
+    return pd.DataFrame(data)
+
+
+def _audit_company_totals(rows: list[dict]):
+    """Промежуточные итоги по компаниям (без разбивки по базам)."""
+
+    totals: dict[str, list] = {}
+    for r in rows:
+        company = r.get("company") or "—"
+        item = totals.setdefault(company, [0, 0.0])
+        item[0] += int(r.get("operations") or 0)
+        item[1] += float(r.get("hours") or 0.0)
+    view = pd.DataFrame([
+        {
+            "Компания": company,
+            "Операций": operations,
+            "Нормочасы": round(hours, 2),
+        }
+        for company, (operations, hours) in sorted(
+            totals.items(), key=lambda kv: kv[0].lower()
+        )
+    ])
+    return view
+
+
+def render_audit_tab():
+    """Вкладка «Аудит»: запуск фонового обхода и мониторинг (админ)."""
+
+    st.title("Глубокий аудит данных")
+    if not _is_admin():
+        st.warning("Нужна роль администратора.")
+        return
+
+    info = audit_runner.status()
+    running = bool(info.get("running"))
+
+    notice = st.session_state.pop("audit_notice", None)
+    if notice:
+        st.success(notice)
+
+    if running:
+        pid = info.get("pid") or "—"
+        period = (
+            f", период {info['start']}…{info['end']}"
+            if info.get("start") and info.get("end") else ""
+        )
+        st.warning(
+            f"Аудит выполняется: {_audit_scope_label(info.get('scope'))}, "
+            f"PID {pid}{period}."
+        )
+        if st.button("Остановить аудит", key="audit_stop"):
+            audit_runner.stop()
+            st.session_state["audit_notice"] = (
+                "Сигнал остановки отправлен — состояние сохранится, "
+                "повторный запуск продолжит с прерванного чанка."
+            )
+            st.rerun()
+    else:
+        st.success("Аудит не выполняется.")
+
+    bases = _list_bases_or_error(active_only=True)
+    base_options = {b["name"]: b for b in bases}
+
+    scope_label = st.radio(
+        "Область", ("Все базы", "Одна база"),
+        horizontal=True, key="audit_scope",
+    )
+    with st.form("audit_launch_form"):
+        st.markdown("**Запуск аудита**")
+        base_name = st.selectbox(
+            "База", list(base_options) or ["—"],
+            key="audit_base",
+            disabled=(scope_label != "Одна база"),
+        )
+        col_start, col_end = st.columns(2)
+        period_start = col_start.date_input(
+            "Начало периода", value=date(2026, 1, 1), key="audit_start",
+        )
+        period_end = col_end.date_input(
+            "Конец периода", value=date(2026, 12, 31), key="audit_end",
+        )
+        include_unmapped = st.checkbox(
+            "Включать нереестровые Document_* (глубокий поиск gaps)",
+            value=False, key="audit_unmapped",
+        )
+        submitted = st.form_submit_button(
+            "Запустить аудит", disabled=running,
+        )
+
+    if submitted:
+        try:
+            start_iso, end_iso = period_start.isoformat(), period_end.isoformat()
+            if scope_label == "Одна база":
+                chosen = base_options.get(base_name)
+                if not chosen:
+                    raise ValueError("Не выбрана база для одиночного аудита")
+                audit_runner.launch(
+                    "single", start_iso, end_iso,
+                    base_filter=chosen["name"],
+                    include_unmapped=include_unmapped,
+                )
+            else:
+                audit_runner.launch(
+                    "all", start_iso, end_iso,
+                    include_unmapped=include_unmapped,
+                )
+        except (ValueError, audit.AuditBusyError) as e:
+            st.error(f"Не удалось запустить аудит: {e}")
+        else:
+            st.session_state["audit_notice"] = "Аудит запущен в фоне."
+            st.rerun()
+
+    st.divider()
+    head_left, head_right = st.columns([4, 1])
+    head_left.subheader("Нормочасы по итогам аудита")
+    if head_right.button("Обновить", key="audit_refresh"):
+        st.rerun()
+
+    rows = audit.audit_summary()
+    if not rows:
+        st.info(
+            "История аудита пуста. Запустите аудит, чтобы увидеть данные."
+        )
+    else:
+        show_base = scope_label != "Одна база"
+        base_filter = (
+            base_name
+            if scope_label == "Одна база" and base_name in base_options
+            else None
+        )
+        st.caption(
+            "Последний прогон по выбранной области; "
+            "детализация — компания и ответственный сотрудник."
+        )
+        hours_rows = audit.audit_hours_summary(base_filter)
+
+        if not hours_rows:
+            st.warning(
+                "Для последних прогонов нет данных о нормочасах. "
+                "Запустите аудит заново (или возобновите его) — старые "
+                "завершённые чанки будут досчитаны автоматически."
+            )
+        else:
+            if any(
+                str(r.get("run_status")) == "RUNNING" for r in hours_rows
+            ):
+                st.warning(
+                    "Аудит ещё выполняется: нормочасы по этой области "
+                    "показаны частично."
+                )
+
+            companies = sorted(
+                {str(r.get("company") or "") for r in hours_rows},
+                key=str.lower,
+            )
+            selected_companies = st.multiselect(
+                "Компании", companies, default=companies,
+                key="audit_hours_companies",
+                format_func=lambda v: v or "—",
+            )
+            employees = sorted(
+                {str(r.get("employee") or "") for r in hours_rows},
+                key=str.lower,
+            )
+            selected_employees = st.multiselect(
+                "Сотрудники", employees, default=employees,
+                key="audit_hours_employees",
+                format_func=lambda v: v or "Не распределено",
+            )
+            filtered = [
+                r for r in hours_rows
+                if str(r.get("company") or "") in selected_companies
+                and str(r.get("employee") or "") in selected_employees
+            ]
+
+            total_hours = sum(float(r.get("hours") or 0.0) for r in filtered)
+            total_ops = sum(int(r.get("operations") or 0) for r in filtered)
+            metric_cols = st.columns(4)
+            metric_cols[0].metric("Нормочасы", f"{total_hours:.2f}")
+            metric_cols[1].metric("Операций", f"{total_ops}")
+            metric_cols[2].metric(
+                "Компаний",
+                f"{len({r.get('company') for r in filtered})}",
+            )
+            metric_cols[3].metric(
+                "Сотрудников",
+                f"{len({r.get('employee') for r in filtered})}",
+            )
+
+            if not filtered:
+                st.info("Нет строк под выбранные фильтры.")
+            else:
+                st.dataframe(
+                    _audit_hours_table(filtered, show_base),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Нормочасы": st.column_config.NumberColumn(
+                            "Нормочасы", format="%.2f"
+                        ),
+                    },
+                )
+                st.markdown("**Итого по компаниям**")
+                st.dataframe(
+                    _audit_company_totals(filtered),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Нормочасы": st.column_config.NumberColumn(
+                            "Нормочасы", format="%.2f"
+                        ),
+                    },
+                )
+                if total_ops and total_hours == 0:
+                    st.warning(
+                        "Операции есть, но нормочасы равны нулю: проверьте "
+                        "активные нормы для этих видов документов."
+                    )
+
+        with st.expander(
+            "Техническое состояние аудита (расхождения, gaps, ошибки)"
+        ):
+            st.dataframe(
+                _audit_summary_table(rows), use_container_width=True
+            )
+
+    if st.checkbox("Показать последние строки лога", key="audit_show_log"):
+        tail = audit_runner.read_log_tail()
+        st.code(tail or "(лог пуст)", language="text")
+
+
 def render_users_tab():
     st.title("Пользователи")
     if not _is_admin():
@@ -1845,6 +2166,8 @@ def main():
     if flags["can_manage_employees"]:
         tabs_def.append(("Сотрудники", render_employees_tab))
     tabs_def.append(("Базы и доступ", render_bases_tab))
+    if config.ENABLE_AUDIT_DASHBOARD and _is_admin():
+        tabs_def.append(("Аудит", render_audit_tab))
     if flags["can_manage_users"]:
         tabs_def.append(("Пользователи", render_users_tab))
 

@@ -340,3 +340,82 @@ def test_retry_respects_metadata_fetch(stub_server, monkeypatch):
         "Document_ОперацияБух": "StandardODATA.Document_ОперацияБух"
     }
     assert _StubHandler.counter == 2
+
+# ====================== ЖУРНАЛ ОПЕРАЦИЙ (GAP SOURCE) ======================
+
+def _journal_client(records, sets):
+    client = _client()
+    client.fetch_metadata_entity_sets = lambda: sets
+    calls = []
+
+    def fake_get(url, params=None, timeout=None):
+        calls.append(url)
+        return _FakeResponse({"value": list(records)}, 200, url)
+
+    client.session.get = fake_get
+    return client, calls
+
+
+def test_fetch_journal_document_types_parses_ref_type():
+    """Ref_Type (машинное имя) → счётчики Document_*; прочее игнорируется."""
+    client, calls = _journal_client(
+        [
+            {"Ref_Type": "StandardODATA.Document_A"},
+            {"Ref_Type": "StandardODATA.Document_B"},
+            {"Ref_Type": "StandardODATA.Document_A"},
+            {"Ref_Type": "StandardODATA.Catalog_X"},
+            {"Ref_Type": None},
+        ],
+        {"DocumentJournal_ЖурналОпераций": "StandardODATA.DocumentJournal"},
+    )
+
+    counts = client.fetch_journal_document_types("2026-01-01", "2026-01-31")
+
+    assert counts == {"Document_A": 2, "Document_B": 1}
+    assert len(calls) == 1
+    assert "DocumentJournal_" in calls[0]
+
+
+def test_fetch_journal_document_types_cached_per_period():
+    client, calls = _journal_client(
+        [{"Ref_Type": "StandardODATA.Document_A"}],
+        {"DocumentJournal_ЖурналОпераций": "StandardODATA.DocumentJournal"},
+    )
+
+    first = client.fetch_journal_document_types("2026-01-01", "2026-01-31")
+    second = client.fetch_journal_document_types("2026-01-01", "2026-01-31")
+    third = client.fetch_journal_document_types("2026-02-01", "2026-02-28")
+
+    assert first == second == third == {"Document_A": 1}
+    assert len(calls) == 2  # по одному скану на период
+
+
+def test_fetch_journal_ref_types_keeps_non_document_and_shares_cache():
+    """Полный разбор журнала сохраняет не-Document_ типы; кэш общий."""
+    client, calls = _journal_client(
+        [
+            {"Ref_Type": "StandardODATA.Document_A"},
+            {"Ref_Type": "StandardODATA.Catalog_X"},
+            {"Ref_Type": "StandardODATA.Document_A"},
+        ],
+        {"DocumentJournal_ЖурналОпераций": "StandardODATA.DocumentJournal"},
+    )
+
+    refs = client.fetch_journal_ref_types("2026-01-01", "2026-01-31")
+    docs = client.fetch_journal_document_types("2026-01-01", "2026-01-31")
+
+    assert refs == {"Document_A": 2, "Catalog_X": 1}
+    assert docs == {"Document_A": 2}
+    assert len(calls) == 1  # общий кэш: один скан сети
+
+
+def test_fetch_journal_document_types_absent_returns_none():
+    client, calls = _journal_client(
+        [],
+        {"Document_A": "StandardODATA.Document_A"},
+    )
+
+    assert client.fetch_journal_document_types(
+        "2026-01-01", "2026-01-31"
+    ) is None
+    assert calls == []

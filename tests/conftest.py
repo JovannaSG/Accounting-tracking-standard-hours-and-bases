@@ -39,6 +39,12 @@ def pytest_configure(config):
     # Настоящий users.json (если создан) не должен сеять пользователей в тестах:
     # указываем на несуществующий путь → load_users_config() вернёт {}.
     os.environ["AUDIT_USERS_CONFIG"] = os.path.join(_APP_TEST_DIR, "users.json")
+    # Дашборд аудита в коде включён по умолчанию, но тесты должны иметь
+    # детерминированную базу «выключено»: tests/test_scanner.py перечитывает
+    # core/config.py через importlib.reload, и без явного значения флаг
+    # «протёк» бы в точные проверки набора вкладок в tests/test_ui.py.
+    # Конкретные тесты включают его адресно (config.ENABLE_AUDIT_DASHBOARD=True).
+    os.environ["ENABLE_AUDIT_DASHBOARD"] = "0"
     # AppTest.from_function исполняет ТОЛЬКО исходник функции как отдельный
     # скрипт, поэтому модульные переменные тестов ему недоступны. Корень
     # проекта передаём через переменную окружения, иначе пришлось бы зашивать

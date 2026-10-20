@@ -39,3 +39,36 @@ ENABLE_REGISTRY_SCANNER = _flag("ENABLE_REGISTRY_SCANNER")
 REGISTRY_SOURCE = (
     str(os.environ.get("REGISTRY_SOURCE") or "json").strip().lower() or "json"
 )
+
+# Дашборд глубокого аудита (вкладка «Аудит»). По умолчанию включён; панель
+# видит только администратор. Отключение: ENABLE_AUDIT_DASHBOARD=0
+# (см. .env.example).
+ENABLE_AUDIT_DASHBOARD = _flag("ENABLE_AUDIT_DASHBOARD", "1")
+
+# Каталог рабочих файлов аудита (блокировка/статус/лог). По умолчанию — рядом
+# с AUDIT_HISTORY_DB: в docker-томе /data это переживает перезапуск
+# контейнера. Пути переопределяются переменными окружения.
+_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_AUDIT_DIR = os.path.dirname(
+    os.path.abspath(
+        os.environ.get(
+            "AUDIT_HISTORY_DB", os.path.join(_PKG_ROOT, "audit_history.db")
+        )
+    )
+)
+
+# Файл эксклюзивной блокировки (flock): удерживается процессом аудита на всё
+# время прогона, поэтому отличает «выполняется» от устаревшего PID-файла.
+AUDIT_LOCK_FILE = os.environ.get(
+    "AUDIT_LOCK_FILE", os.path.join(_AUDIT_DIR, ".audit.lock")
+)
+
+# Статус запущенного из UI аудита: PID, область, период (JSON).
+AUDIT_STATUS_FILE = os.environ.get(
+    "AUDIT_STATUS_FILE", os.path.join(_AUDIT_DIR, ".audit.status.json")
+)
+
+# Лог фонового аудита, запущенного из UI.
+AUDIT_UI_LOG = os.environ.get(
+    "AUDIT_UI_LOG", os.path.join(_AUDIT_DIR, "audit_ui.log")
+)
