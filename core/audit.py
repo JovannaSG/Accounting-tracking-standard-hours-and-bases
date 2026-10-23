@@ -1,4 +1,3 @@
-# core/audit.py
 """Глубокий аудит данных 1С:Фреш (Phase 2-3).
 
 Checkpoint-состояние живёт в отдельной БД ``audit_history.db``
@@ -39,8 +38,19 @@ from core.norms import load_doc_types
 from core.reporters import BORDER, CENTER, HEADER_FILL, HEADER_FONT
 
 
+def _is_select_error(message: str) -> bool:
+    """
+    Признак 400/500, совместимый с поведением клиента
+    """
+
+    return "400" in message or "500" in message
+
+
 class AuditBusyError(RuntimeError):
-    """Аудит уже выполняется: блокировка удерживается другим процессом."""
+    """
+    Аудит уже выполняется: блокировка удерживается другим процессом
+    """
+
 
 _TIME = time  # патчится в тестах (паузы между запросами)
 
@@ -49,15 +59,16 @@ _CHUNK_NOT_APPLICABLE = "NOT_APPLICABLE"
 
 # ====================== ЧАНКИНГ ПО КАЛЕНДАРНЫМ МЕСЯЦАМ ======================
 
-
 def _month_chunks(period_start: str, period_end: str) -> list[tuple[str, str]]:
-    """Дробит период на календарные месяцы (включительно).
+    """
+    Дробит период на календарные месяцы (включительно).
 
     ``("2026-01-15", "2026-03-10")`` ->
     ``[("2026-01-15","2026-01-31"), ("2026-02-01","2026-02-28"),
     ("2026-03-01","2026-03-10")]``. Точные границы reduce запросов
     1С:Фреш и дают естественные «фрагменты» для checkpoint'ов.
     """
+
     from calendar import monthrange
 
     s = date.fromisoformat(period_start)
@@ -73,17 +84,19 @@ def _month_chunks(period_start: str, period_end: str) -> list[tuple[str, str]]:
         month_last = cur.replace(day=monthrange(cur.year, cur.month)[1])
         end = month_last if month_last < e else e
         chunks.append((cur.isoformat(), end.isoformat()))
-        cur = date(cur.year + 1, 1, 1) if cur.month == 12 else date(
-            cur.year, cur.month + 1, 1
-        )
+        if cur.month == 12:
+            cur = date(cur.year + 1, 1, 1)
+        else:
+            cur = date(cur.year, cur.month + 1, 1)
     return chunks
 
 
 # =========================== УТИЛИТЫ ТРАНСПОРТА ==============================
 
-
 def _amount(rec: dict) -> float:
-    """Числовой итог документа; мусор/None → 0.0 (не роняем чанк)."""
+    """
+    Числовой итог документа; мусор/None → 0.0 (не роняем чанк)
+    """
 
     raw = rec.get("СуммаДокумента")
     try:
@@ -98,7 +111,8 @@ def _count_records(
     chunk_start: str,
     chunk_end: str,
 ) -> tuple[int | None, bool]:
-    """Лёгкий ``$top=1&$inlinecount=allpages`` с тем же фильтром по Date.
+    """
+    Лёгкий ``$top=1&$inlinecount=allpages`` с тем же фильтром по Date.
 
     Возвращает ``(total, available)``. 1С:Фреш отвергает OData v4-параметр
     ``$count=true`` (HTTP 501), но поддерживает v2/v3-синтаксис
@@ -106,6 +120,7 @@ def _count_records(
     Если счётчик всё равно недоступен — ``(None, False)``: аудит деградирует
     в export-only, без hard-fail.
     """
+
     start_safe = client._start_of_day(chunk_start)
     end_safe = client._end_of_day(chunk_end)
     ffilter = (
@@ -132,10 +147,10 @@ def _count_records(
 
 # ====================== БЛОКИРОВКА И СИГНАЛЫ ================================
 
-
 @contextmanager
 def _audit_lock(path: str):
-    """Эксклюзивная блокировка аудита (flock, неблокирующая).
+    """
+    Эксклюзивная блокировка аудита (flock, неблокирующая).
 
     Держится процессом на всё время прогона; автоматически снимается ОС при
     завершении (в т.ч. по SIGTERM/Ctrl+C), поэтому устаревший файл не мешает.
@@ -160,7 +175,8 @@ def _audit_lock(path: str):
 
 
 def _install_sigterm_handler() -> None:
-    """SIGTERM (кнопка «Остановить» в UI) → KeyboardInterrupt.
+    """
+    SIGTERM (кнопка «Остановить» в UI) → KeyboardInterrupt.
 
     Так остановка из UI использует тот же бережный путь, что и Ctrl+C:
     сообщение «состояние сохранено», код 130, незавершённый чанк остаётся
@@ -179,13 +195,14 @@ def _install_sigterm_handler() -> None:
 
 # ============================= ДВИЖОК АУДИТА =================================
 
-
 def _audit_entity_specs(base: dict) -> dict[str, list[tuple[str, dict]]]:
-    """Сущность -> список (ключ, спека) для маршрутизации вариантов норм.
+    """
+    Сущность -> список (ключ, спека) для маршрутизации вариантов норм.
 
     Учитывает ``bases.active_doc_types``: пустой список = все виды реестра
     (прецедент — core.fetch.fetch_documents).
     """
+
     registry = load_doc_types()
     keys = base.get("active_doc_types") or list(registry.keys())
     by_entity: dict[str, list[tuple[str, dict]]] = {}
@@ -197,7 +214,8 @@ def _audit_entity_specs(base: dict) -> dict[str, list[tuple[str, dict]]]:
 
 
 def _audit_entities(base: dict) -> list[str]:
-    """Уникальные OData-сущности реестра в порядке doc_types.json."""
+    """
+    Уникальные OData-сущности реестра в порядке doc_types.json."""
 
     return list(_audit_entity_specs(base))
 
@@ -212,8 +230,10 @@ def run_audit(
     restart: bool = False,
     entities: list[str] | None = None,
     gap_source: str = "auto",
+    chunk_mode: str = "month"
 ) -> dict:
-    """Прогоняет аудит базы за период; резюмирует через checkpoint'ы.
+    """
+    Прогоняет аудит базы за период; резюмирует через checkpoint'ы.
 
     - (entity × месяц) как чанк: COMPLETED пропускаются, RUNNING/FAILED
       перезапускаются ровно с этой точки (без дублей сети);
@@ -228,9 +248,12 @@ def run_audit(
     ``client``/``entities`` — тестовые интерфейсы: движок не строит сетевого
     клиента, если клиент уже передан; сущности — из реестра, а не сети.
     """
+
     base_url = str(base["url"]).rstrip("/")
     client = client or OneCClient(
-        base_url, base.get("login") or "", base.get("password") or ""
+        base_url,
+        base.get("login") or "",
+        base.get("password") or ""
     )
 
     init_audit_db = db.init_audit_db
@@ -265,11 +288,16 @@ def run_audit(
 
     entity_specs = _audit_entity_specs(base)
     selected_entities = entities or list(entity_specs)
-    chunk_items = [
-        (entity, entity_specs.get(entity) or [(entity, {"title": entity})],
-         chunk)
+
+    if chunk_mode == "period":
+        chunks = [(period_start, period_end)]
+    else:
+        chunks = _month_chunks(period_start, period_end)
+
+    chunk_items: list = [
+        (entity, entity_specs.get(entity) or [(entity, {"title": entity})], chunk)
         for entity in selected_entities
-        for chunk in _month_chunks(period_start, period_end)
+        for chunk in chunks
     ]
     summary["chunks_total"] = len(chunk_items)
 
@@ -326,7 +354,9 @@ def _business_bucket(
     cache: dict[tuple[str, str], dict],
     buckets: dict[tuple[str, str], list],
 ) -> None:
-    """Добавляет документ в агрегат (компания × сотрудник) с кэшем резолва."""
+    """
+    Добавляет документ в агрегат (компания × сотрудник) с кэшем резолва
+    """
 
     key, spec = resolve_doc_spec(entries, rec)
     title = str(spec.get("title") or key)
@@ -364,7 +394,9 @@ def _run_chunk(
     by_title: dict[str, dict] | None = None,
     employees: list[dict] | None = None,
 ) -> str:
-    """Аудит одного (entity × месяц); возвращает итоговый статус чанка."""
+    """
+    Аудит одного (entity × месяц); возвращает итоговый статус чанка
+    """
 
     conn = db._audit_conn()
     try:
@@ -519,6 +551,49 @@ def _run_chunk(
         finally:
             conn.close()
         return _CHUNK_NOT_APPLICABLE
+    except ValueError as e:
+        msg = str(e)
+        # 400/500, невозможность построить совместимый $select даже после
+        # фолбэка — не фатальный сбой аудита всей базы: помечаем завершённым
+        # с 0 строк, чтобы можно было резюмировать и увидеть в сводке.
+        if _is_select_error(msg) or "400" in msg or "500" in msg:
+            finished = datetime.now().isoformat(timespec="seconds")
+            conn = db._audit_conn()
+            try:
+                db.replace_audit_hours(
+                    base_url, entity, chunk_start, chunk_end, run_id, []
+                )
+                conn.execute(
+                    "UPDATE audit_checkpoints SET status=?, rows_processed=0, "
+                    "sum_amount=0, page_count=0, degraded=1, expected_count=NULL, "
+                    "count_available=0, count_mismatch=0, error=?, finished_at=? "
+                    "WHERE base_url=? AND entity_name=? AND chunk_start=? "
+                    "AND chunk_end=?",
+                    (db.AUDIT_CP_COMPLETED,
+                     f"сущность недоступна для построчного извлечения: {msg[:400]}",
+                     finished, base_url, entity, chunk_start, chunk_end),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            return db.AUDIT_CP_COMPLETED
+        failed = datetime.now().isoformat(timespec="seconds")
+        conn = db._audit_conn()
+        try:
+            db.replace_audit_hours(
+                base_url, entity, chunk_start, chunk_end, run_id, []
+            )
+            conn.execute(
+                "UPDATE audit_checkpoints SET status=?, error=?, finished_at=? "
+                "WHERE base_url=? AND entity_name=? AND chunk_start=? "
+                "AND chunk_end=?",
+                (db.AUDIT_CP_FAILED, msg[:500], failed,
+                 base_url, entity, chunk_start, chunk_end),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return db.AUDIT_CP_FAILED
     except Exception as e:
         failed = datetime.now().isoformat(timespec="seconds")
         conn = db._audit_conn()
@@ -537,7 +612,8 @@ def _run_chunk(
 
 
 def _persist_gaps(base_url: str, gaps: list[dict]) -> None:
-    """Пишет снимок счётчиков нереестровых Document_* для базы.
+    """
+    Пишет снимок счётчиков нереестровых Document_* для базы.
 
     Строки прошлого прогона удаляются: источник (журнал/`$metadata`) мог
     перестать возвращать сущность, и её старый счётчик не должен «залипать»
@@ -579,7 +655,8 @@ def _run_gap_counts(
     period_end: str,
     gap_source: str = "auto",
 ) -> tuple[list[dict], str]:
-    """Счётчики нереестровых ``Document_*`` (только --include-unmapped).
+    """
+    Счётчики нереестровых ``Document_*`` (только --include-unmapped).
 
     Источник списка сущностей:
     - ``journal`` — журнал операций (один запрос): ``Ref_Type`` даёт типы,
@@ -591,6 +668,7 @@ def _run_gap_counts(
 
     Возвращает ``(gaps, source)``; ``source`` — "journal"/"metadata"/"none".
     """
+
     registry_set = set(registry_entities)
 
     if gap_source in ("auto", "journal"):
@@ -682,7 +760,9 @@ def _finalize_run(run_id: int, status: str, error: str | None = None) -> None:
 
 
 def _resolve_base(name_or_url: str) -> dict | None:
-    """База из таблицы bases по имени (без учёта регистра), URL или id."""
+    """
+    База из таблицы bases по имени (без учёта регистра), URL или id
+    """
 
     needle = str(name_or_url or "").strip()
     if not needle:
@@ -700,18 +780,19 @@ def _resolve_base(name_or_url: str) -> dict | None:
 
 # ================================ ОТЧЁТ ======================================
 
-
 def write_audit_report(
     summary: dict,
     out_dir: str = "exports",
 ) -> str:
-    """Формирует ``exports/audit_*.xlsx``: «Сводка», «Проблемы», «Gaps».
+    """
+    Формирует ``exports/audit_*.xlsx``: «Сводка», «Проблемы», «Gaps».
 
     Каждая строка Сводки — checkpoint (entity × месяц). «Проблемы» — вход
     для ручной сверки: расхождения с ожидаемым количеством (``$inlinecount``,
     миграция данных), деградация (data-poor), ошибки выгрузки. Возвращает
     путь к файлу.
     """
+
     import os
 
     os.makedirs(out_dir, exist_ok=True)
@@ -793,7 +874,7 @@ def _write_problems_sheet(
     checkpoints: list[dict],
 ) -> None:
     ws = workbook.create_sheet("Проблемы")
-    headers = ["Сущность", "Чанк с", "Чанк по", "Проблема", "Детали"]
+    headers: list = ["Сущность", "Чанк с", "Чанк по", "Проблема", "Детали"]
     _style_headers(ws, headers)
     row_i = 2
     for cp in checkpoints:
@@ -845,9 +926,10 @@ def _write_gaps_sheet(
 
 # ================================== CLI ======================================
 
-
 def _problems_in_checkpoints(checkpoints: list[dict]) -> list[dict]:
-    """Проблемные чанки по тем же правилам, что лист «Проблемы» отчёта."""
+    """
+    Проблемные чанки по тем же правилам, что лист «Проблемы» отчёта
+    """
 
     return [
         cp for cp in checkpoints
@@ -858,7 +940,8 @@ def _problems_in_checkpoints(checkpoints: list[dict]) -> list[dict]:
 
 
 def _summarize_base(base: dict | None, base_url: str) -> dict:
-    """Сводка текущего состояния аудита одной базы (из БД, без сети).
+    """
+    Сводка текущего состояния аудита одной базы (из БД, без сети).
 
     Агрегирует checkpoint'ы по ``base_url`` (см.
     ``db.list_audit_checkpoints_by_base``); статусы чанков: ``done`` —
@@ -914,12 +997,15 @@ def _summarize_base(base: dict | None, base_url: str) -> dict:
 
 
 def audit_summary(base_filter: str | None = None) -> list[dict]:
-    """Сводка по базам с историей аудита (свежие базы — по имени).
+    """
+    Сводка по базам с историей аудита (свежие базы — по имени).
 
     ``base_filter`` (имя/URL/id) сужает до одной базы; неизвестная — ValueError.
     """
 
-    names = {b["url"].rstrip("/"): b for b in db.list_bases()}
+    names: dict = {
+        b["url"].rstrip("/"): b for b in db.list_bases()
+    }
 
     if base_filter:
         base = _resolve_base(base_filter)
@@ -939,7 +1025,8 @@ def audit_summary(base_filter: str | None = None) -> list[dict]:
 
 
 def audit_hours_summary(base_filter: str | None = None) -> list[dict]:
-    """Нормочасы последнего прогона по каждой базе, разбитые по компании/сотруднику.
+    """
+    Нормочасы последнего прогона по каждой базе, разбитые по компании/сотруднику.
 
     Объединяет ``audit_summary`` (какой run считать актуальным для базы) с
     агрегатом ``audit_hours``. Пустые чанки-маркеры уже отфильтрованы в
@@ -973,7 +1060,9 @@ def audit_hours_summary(base_filter: str | None = None) -> list[dict]:
 
 
 def audit_base_detail(base_url: str) -> list[dict]:
-    """Разбивка чанков базы по сущностям (для ``--summary --base``)."""
+    """
+    Разбивка чанков базы по сущностям (для ``--summary --base``)
+    """
 
     by_entity: dict[str, dict] = {}
     for cp in db.list_audit_checkpoints_by_base(base_url):
@@ -996,25 +1085,50 @@ def audit_base_detail(base_url: str) -> list[dict]:
     return detail
 
 
+def _probe_entity_scannable(
+    client: OneCClient,
+    entity: str,
+    period_start: str,
+    period_end: str,
+) -> bool:
+    """
+    Можно ли реально читать документы сущности построчно (``$top=1``)
+    """
+
+    try:
+        iterator = client.fetch_documents_iter(
+            entity, period_start, period_end, page_size=1
+        )
+        next(iterator, None)
+        return True
+    except (EntityNotFoundError, ValueError, KeyError, TypeError):
+        return False
+
+
 def verify_journal_coverage(
     base: dict,
     period_start: str,
     period_end: str,
     client: OneCClient | None = None,
 ) -> dict:
-    """Проверка: все ли записи журнала операций покрыты аудитом.
+    """
+    Проверка: все ли записи журнала операций покрыты аудитом.
 
-    Аудит покрывает запись журнала одним из двух способов:
+    Аудит покрывает запись журнала одним из способов:
 
-    * ``registry`` — тип есть в реестре ``doc_types.json``: документы
-      читаются поштучно (строки/суммы/нормочасы);
+    * ``registry`` — тип есть в реестре ``doc_types.json`` **и** его документы
+      реально читаются построчно (строки/суммы/нормочасы);
     * ``gap`` — тип не в реестре, но начинается с ``Document_``: количество
-      учитывается в счётчиках gaps (при ``--include-unmapped``).
+      учитывается в счётчиках gaps (при ``--include-unmapped``);
+    * ``unscannable`` — тип есть в реестре, но его сущность не читается
+      построчно (например, у документа нет поля ``Number`` и 1С отвергает
+      ``$select``) → нормочасы по нему посчитать нельзя;
+    * ``uncovered`` — ``Ref_Type`` вне ``Document_*``: не попадёт ни в аудит,
+      ни в gaps.
 
-    Любой другой ``Ref_Type`` (не ``Document_*``) — **дыра покрытия**:
-    он не попадёт ни в аудит, ни в gaps. Возвращает отчёт с разбивкой по
-    типам, флагом ``available`` (журнал недоступен) и списком
-    ``uncovered``. Ручные (``Document_ОперацияБух``) и регламентные
+    Возвращает отчёт с разбивкой по типам, флагом ``available`` (журнал
+    недоступен), списками ``unscannable`` и ``uncovered``. Ручные
+    (``Document_ОперацияБух``) и регламентные
     (``Document_РегламентнаяОперация``) операции выделяются отдельно.
     """
 
@@ -1034,6 +1148,8 @@ def verify_journal_coverage(
         "manual": 0,
         "routine": 0,
         "types": [],
+        "unscannable": [],
+        "unscannable_rows": 0,
         "uncovered": [],
     }
     if refs is None:
@@ -1042,9 +1158,14 @@ def verify_journal_coverage(
     registry = {s["entity"] for s in load_doc_types().values() if s.get("entity")}
     entries: list[dict] = []
     uncovered: list[str] = []
+    unscannable: list[str] = []
     for name, count in sorted(refs.items()):
         if name in registry:
-            covered_by = "registry"
+            if _probe_entity_scannable(client, name, period_start, period_end):
+                covered_by = "registry"
+            else:
+                covered_by = "unscannable"
+                unscannable.append(name)
         elif name.startswith("Document_"):
             covered_by = "gap"
         else:
@@ -1052,7 +1173,12 @@ def verify_journal_coverage(
             uncovered.append(name)
         entries.append({"type": name, "count": count, "covered_by": covered_by})
     total = sum(e["count"] for e in entries)
-    covered = sum(e["count"] for e in entries if e["covered_by"] != "uncovered")
+    covered = sum(
+        e["count"] for e in entries if e["covered_by"] in ("registry", "gap")
+    )
+    unscannable_rows = sum(
+        e["count"] for e in entries if e["covered_by"] == "unscannable"
+    )
     report.update(
         total=total,
         covered=covered,
@@ -1060,15 +1186,19 @@ def verify_journal_coverage(
         manual=refs.get("Document_ОперацияБух", 0),
         routine=refs.get("Document_РегламентнаяОперация", 0),
         types=entries,
+        unscannable=unscannable,
+        unscannable_rows=unscannable_rows,
         uncovered=uncovered,
     )
     return report
 
 
 def format_journal_coverage(report: dict) -> str:
-    """Человекочитаемая печать отчёта ``verify_journal_coverage``."""
+    """
+    Человекочитаемая печать отчёта ``verify_journal_coverage``
+    """
 
-    lines = [
+    lines: list = [
         f"База: {report['base_name']}",
         f"Период: {report['period_start']}..{report['period_end']}",
     ]
@@ -1076,12 +1206,13 @@ def format_journal_coverage(report: dict) -> str:
         lines.append("Журнал операций недоступен — покрытие не проверено.")
         return "\n".join(lines)
 
-    source_label = {
+    source_label: dict = {
         "registry": "реестр (поштучно)",
         "gap": "нереестровый (счётчик gaps)",
+        "unscannable": "НЕДОСТУПНО ДЛЯ ПОСТРОЧНОГО АУДИТА",
         "uncovered": "НЕ ПОКРЫТО",
     }
-    rows = [
+    rows: list = [
         [e["type"], e["count"], source_label[e["covered_by"]]]
         for e in report["types"]
     ]
@@ -1095,6 +1226,12 @@ def format_journal_coverage(report: dict) -> str:
         f"Ручные (Document_ОперацияБух): {report['manual']}, "
         f"регламентные (Document_РегламентнаяОперация): {report['routine']}."
     )
+    if report.get("unscannable"):
+        lines.append(
+            "ВНИМАНИЕ, сущности недоступны для построчного аудита "
+            f"({report.get('unscannable_rows', 0)} записей): "
+            + ", ".join(report["unscannable"])
+        )
     if report["uncovered"]:
         lines.append(
             "ВНИМАНИЕ, дыры покрытия (не Journal Document_*): "
@@ -1104,23 +1241,30 @@ def format_journal_coverage(report: dict) -> str:
 
 
 def _render_table(headers: list[str], rows: list[list]) -> str:
-    """Простая выровненная таблица (ширины по содержимому)."""
+    """
+    Простая выровненная таблица (ширины по содержимому)
+    """
 
-    widths = [len(h) for h in headers]
+    widths: list = [len(h) for h in headers]
     for row in rows:
         for i, value in enumerate(row):
             widths[i] = max(widths[i], len(str(value)))
     lines = ["  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))]
     lines.append("  ".join("-" * w for w in widths))
     for row in rows:
-        lines.append("  ".join(str(v).ljust(widths[i])
-                               for i, v in enumerate(row)))
+        lines.append(
+            "  ".join(
+                str(v).ljust(widths[i])
+                for i, v in enumerate(row)
+            )
+        )
     return "\n".join(lines)
 
 
-_SUMMARY_HEADERS = [
+_SUMMARY_HEADERS: list[str] = [
     "База", "id", "Прогон", "Статус", "Период", "Чанков",
-    "Готово", "Пусто", "Ошибок", "Расхожд.", "Данных-бедно", "Gaps", "Проблемы",
+    "Готово", "Пусто", "Ошибок", "Расхожд.", "Данных-бедно",
+    "Gaps", "Проблемы",
 ]
 
 
@@ -1144,20 +1288,27 @@ def _format_summary_table(rows: list[dict]) -> str:
 
 
 def _format_base_detail(row: dict) -> str:
-    """Сводка одной базы + таблица по сущностям."""
+    """
+    Сводка одной базы + таблица по сущностям
+    """
 
-    block = [_render_table(_SUMMARY_HEADERS, [_summary_row_values(row)]), ""]
+    block: list = [_render_table(_SUMMARY_HEADERS, [_summary_row_values(row)]), ""]
     detail = audit_base_detail(row["base_url"])
-    headers = ["Сущность", "Чанков", "Строк", "Сумма документов",
-               "Расхожд.", "Данных-бедно", "Ошибок"]
-    values = [
+    headers: list = [
+        "Сущность", "Чанков", "Строк", "Сумма документов",
+        "Расхожд.", "Данных-бедно", "Ошибок"
+    ]
+    values: list = [
         [d["entity_name"], d["chunks"], d["rows"], d["sum"],
          d["mismatches"], d["degraded"], d["failed"]]
         for d in detail
     ]
     block.append(f"Детализация по сущностям ({len(detail)}):")
-    block.append(_render_table(headers, values) if values
-                 else "(нет данных)")
+    block.append(
+        _render_table(headers, values)
+        if values
+        else "(нет данных)"
+    )
     return "\n".join(block)
 
 
@@ -1168,7 +1319,9 @@ def _summary_json(rows: list[dict]) -> str:
 
 
 def _write_summary_file(path: str, rows: list[dict], as_json: bool) -> None:
-    """Сохраняет плоскую сводку в файл: JSON либо CSV (разделитель «;»)."""
+    """
+    Сохраняет плоскую сводку в файл: JSON либо CSV (разделитель «;»)
+    """
 
     if as_json:
         with open(path, "w", encoding="utf-8") as f:
@@ -1185,17 +1338,21 @@ def _write_summary_file(path: str, rows: list[dict], as_json: bool) -> None:
 
 
 def _default_out_dir() -> str:
-    """Каталог отчёта по умолчанию.
+    """
+    Каталог отчёта по умолчанию.
 
     В контейнере рабочие данные живут в томе ``/data``; писать отчёт рядом с
     ними, чтобы он переживал пересоздание контейнера. Вне Docker — локальный
     ``exports/``.
     """
+
     return "/data/exports" if Path("/data").is_dir() else "exports"
 
 
 def _print_run_summary(summary: dict, out_dir: str) -> None:
-    """Печатает отчёт и итоговую строку одного прогона."""
+    """
+    Печатает отчёт и итоговую строку одного прогона
+    """
 
     path = write_audit_report(summary, out_dir=out_dir)
     print(f"Отчёт: {path}")
@@ -1227,13 +1384,17 @@ def _run_all_bases(
     include_unmapped: bool,
     restart: bool,
     gap_source: str = "auto",
+    chunk_mode: str = "month"
 ) -> int:
-    """Пакетный обход активных баз: ошибка одной базы не прерывает остальные."""
+    """
+    Пакетный обход активных баз: ошибка одной базы не прерывает остальные
+    """
 
     bases = db.list_bases(active_only=True)
     if not bases:
         print("Активных баз нет.", file=sys.stderr)
         return 0
+
     total = len(bases)
     failures = 0
     for i, base in enumerate(bases, 1):
@@ -1242,7 +1403,7 @@ def _run_all_bases(
             summary = run_audit(
                 base, start, end, pause=pause,
                 include_unmapped=include_unmapped, restart=restart,
-                gap_source=gap_source,
+                gap_source=gap_source, chunk_mode=chunk_mode
             )
             _print_run_summary(summary, out_dir)
         except Exception as e:
@@ -1253,7 +1414,9 @@ def _run_all_bases(
 
 
 def _coverage_bases(args) -> list[dict]:
-    """Базы для ``--verify-coverage``: одна (--base) или все активные."""
+    """
+    Базы для ``--verify-coverage``: одна (--base) или все активные
+    """
 
     if args.base:
         base = _resolve_base(args.base)
@@ -1262,7 +1425,9 @@ def _coverage_bases(args) -> list[dict]:
 
 
 def _verify_coverage(args) -> int:
-    """Проверка покрытия журнала операций аудитом (без записи в БД)."""
+    """
+    Проверка покрытия журнала операций аудитом (без записи в БД)
+    """
 
     bases = _coverage_bases(args)
     if not bases:
@@ -1277,11 +1442,11 @@ def _verify_coverage(args) -> int:
         print(format_journal_coverage(report))
         if not report["available"]:
             skipped += 1
-        elif report["uncovered"]:
+        elif report["uncovered"] or report.get("unscannable"):
             failures += 1
     if failures:
         print(
-            f"Покрытие проверено: баз с дырами {failures} из {len(bases)}"
+            f"Покрытие проверено: баз с проблемами {failures} из {len(bases)}"
             + (f", журнал недоступен у {skipped}" if skipped else "")
             + ".",
             file=sys.stderr,
@@ -1299,11 +1464,13 @@ def _verify_coverage(args) -> int:
 
 
 def _audit_one(args) -> int:
-    """Аудит одной базы по аргументам CLI (внутри уже взятой блокировки)."""
+    """
+    Аудит одной базы по аргументам CLI (внутри уже взятой блокировки)
+    """
 
     base = _resolve_base(args.base)
     if base is None:
-        names = [b["name"] for b in db.list_bases()]
+        names: list = [b["name"] for b in db.list_bases()]
         print(
             f"База '{args.base}' не найдена. "
             f"Доступные: {', '.join(names) or '-'}",
@@ -1313,7 +1480,7 @@ def _audit_one(args) -> int:
     summary = run_audit(
         base, args.start, args.end, pause=args.pause,
         include_unmapped=args.include_unmapped, restart=args.restart,
-        gap_source=args.gap_source,
+        gap_source=args.gap_source, chunk_mode=args.chunk_mode
     )
     _print_run_summary(summary, args.out)
     return 0
@@ -1324,44 +1491,85 @@ def main(argv: list[str] | None = None) -> int:
         prog="python -m core.audit",
         description="Глубокий аудит данных баз 1С:Фреш (checkpoint-резюм).",
     )
-    parser.add_argument("--base",
-                        help="Имя (или URL/id) базы из таблицы bases")
-    parser.add_argument("--all-bases", action="store_true",
-                        help="Пакетный обход всех активных баз (по одной, "
-                             "продолжает при ошибке отдельной базы)")
+    parser.add_argument(
+        "--base",
+        help="Имя (или URL/id) базы из таблицы bases"
+    )
+    parser.add_argument(
+        "--all-bases",
+        action="store_true",
+        help="Пакетный обход всех активных баз (по одной, \
+            продолжает при ошибке отдельной базы)"
+    )
     parser.add_argument("--start", help="Начало периода, YYYY-MM-DD")
     parser.add_argument("--end", help="Конец периода, YYYY-MM-DD")
-    parser.add_argument("--list-bases", action="store_true",
-                        help="Напечатать активные базы как «id<TAB>имя» и выйти "
-                             "(источник списка для пакетного обхода)")
-    parser.add_argument("--summary", action="store_true",
-                        help="Сводка по истории аудита (без сети): по базам "
-                             "или по одной с --base")
-    parser.add_argument("--problems-only", action="store_true",
-                        help="С --summary: только базы с проблемами")
-    parser.add_argument("--json", action="store_true",
-                        help="С --summary: вывести JSON вместо таблицы")
-    parser.add_argument("--verify-coverage", action="store_true",
-                        help="Проверить, что все записи журнала операций "
-                             "покрыты аудитом (реестр поштучно или счётчик "
-                             "gaps); требует --start/--end и --base/--all-bases")
-    parser.add_argument("--include-unmapped", action="store_true",
-                        help="Подсчитать нереестровые Document_* (журнал "
-                             "операций, иначе $metadata)")
-    parser.add_argument("--gap-source", choices=("auto", "journal", "metadata"),
-                        default="auto",
-                        help="Источник списка нереестровых Document_* для "
-                             "--include-unmapped: auto — журнал операций, "
-                             "иначе $metadata (по умолчанию); journal — только "
-                             "журнал; metadata — полный перебор $metadata")
-    parser.add_argument("--pause", type=float, default=0.2,
-                        help="Пауза между запросами, сек (по умолчанию 0.2)")
-    parser.add_argument("--restart", action="store_true",
-                        help="Перечитать COMPLETED-чанки заново")
-    parser.add_argument("--out", default=None,
-                        help="Для аудита — каталог отчёта (по умолчанию "
-                             "/data/exports в контейнере, иначе exports/); "
-                             "для --summary — файл (JSON при --json, иначе CSV)")
+    parser.add_argument(
+        "--list-bases",
+        action="store_true",
+        help="Напечатать активные базы как «id<TAB>имя» и выйти \
+            (источник списка для пакетного обхода)"
+    )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Сводка по истории аудита (без сети): по базам \
+            или по одной с --base"
+    )
+    parser.add_argument(
+        "--problems-only",
+        action="store_true",
+        help="С --summary: только базы с проблемами"
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="С --summary: вывести JSON вместо таблицы"
+    )
+    parser.add_argument(
+        "--verify-coverage",
+        action="store_true",
+        help="Проверить, что все записи журнала операций \
+            покрыты аудитом (реестр поштучно или счётчик \
+            gaps); требует --start/--end и --base/--all-bases"
+    )
+    parser.add_argument(
+        "--include-unmapped",
+        action="store_true",
+        help="Подсчитать нереестровые Document_* (журнал \
+            операций, иначе $metadata)"
+    )
+    parser.add_argument(
+        "--gap-source",
+        choices=("auto", "journal", "metadata"),
+        default="auto",
+        help="Источник списка нереестровых Document_* для \
+            --include-unmapped: auto — журнал операций, \
+            иначе $metadata (по умолчанию); journal — только \
+            журнал; metadata — полный перебор $metadata"
+        )
+    parser.add_argument(
+        "--pause",
+        type=float, default=0.2,
+        help="Пауза между запросами, сек (по умолчанию 0.2)"
+    )
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Перечитать COMPLETED-чанки заново"
+    )
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Для аудита — каталог отчёта (по умолчанию \
+            /data/exports в контейнере, иначе exports/); \
+            для --summary — файл (JSON при --json, иначе CSV)"
+        )
+    parser.add_argument(
+        "--chunk-mode",
+        choices=("month", "period"),
+        default="month",
+        help="Режим дробления: month (помесячно) или period (целиком)"
+    )
     args = parser.parse_args(argv)
 
     if args.list_bases:
@@ -1378,9 +1586,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.problems_only:
             rows = [r for r in rows if r["has_problems"]]
         if args.base and rows:
-            payload = _summary_json(rows) if args.json else _format_base_detail(rows[0])
+            if args.json:
+                payload = _summary_json(rows)
+            else:
+                payload = _format_base_detail(rows[0])
         else:
-            payload = _summary_json(rows) if args.json else _format_summary_table(rows)
+            if args.json:
+                payload = _summary_json(rows)
+            else:
+                payload = _format_summary_table(rows)
         if args.out:
             _write_summary_file(args.out, rows, as_json=args.json)
             print(f"Сводка: {args.out}")
@@ -1398,8 +1612,10 @@ def main(argv: list[str] | None = None) -> int:
         return _verify_coverage(args)
 
     if not ((args.base or args.all_bases) and args.start and args.end):
-        parser.error("--start и --end обязательны вместе с --base или "
-                     "--all-bases (кроме --list-bases и --summary)")
+        parser.error(
+            "--start и --end обязательны вместе с --base или \
+            --all-bases (кроме --list-bases и --summary)"
+        )
 
     if args.out is None:
         args.out = _default_out_dir()
@@ -1413,6 +1629,7 @@ def main(argv: list[str] | None = None) -> int:
                 return _run_all_bases(
                     args.start, args.end, args.out, args.pause,
                     args.include_unmapped, args.restart, args.gap_source,
+                    args.chunk_mode
                 )
             return _audit_one(args)
     except AuditBusyError as e:

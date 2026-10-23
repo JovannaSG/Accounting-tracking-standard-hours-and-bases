@@ -549,11 +549,15 @@ def test_entity_error_marks_checkpoint_and_run_failed():
         entities=["Document_Err"],
     )
 
-    assert summary["run_status"] == db.AUDIT_RUN_FAILED
-    assert summary["chunks_failed"] == 1
+    # 400/500 без возможности подобрать $select — деградация, а не падение
+    # всего пакетного аудита: чанк завершён с 0 строк и помечен degraded.
+    assert summary["run_status"] == db.AUDIT_RUN_COMPLETED
+    assert summary["chunks_failed"] == 0
     cp = _checkpoint(_BASE["url"], "Document_Err", "2026-01-01", "2026-01-31")
-    assert cp["status"] == db.AUDIT_CP_FAILED
-    assert cp["error"]
+    assert cp["status"] == db.AUDIT_CP_COMPLETED
+    assert cp["rows_processed"] == 0
+    assert cp["degraded"] == 1
+    assert "недоступна для построчного извлечения" in cp["error"]
 
 
 def test_entity_404_is_not_applicable_not_failed(tmp_path):
@@ -639,7 +643,12 @@ def test_gaps_without_flag_skips_metadata():
 
     assert "gaps_count" not in summary
     assert db.list_audit_gap_counts(_BASE["url"]) == []
-    assert not any("/$metadata" in u for u in fake.requests_seen)
+    # Снимок $metadata для выбора полей допустим, но перебора нереестровых
+    # сущностей (источника gaps) быть не должно.
+    assert not any(
+        "Document_НеРеестровое" in u for u in fake.requests_seen
+    )
+    assert not any("DocumentJournal_" in u for u in fake.requests_seen)
 
 
 def _journal_row(entity: str, ref: str = "r") -> dict:
@@ -825,6 +834,32 @@ def test_verify_journal_coverage_counts_manual_and_routine(monkeypatch):
     assert by_type["Document_РегламентнаяОперация"] == "gap"
 
 
+def test_verify_journal_coverage_flags_unscannable_registry_entity(
+    monkeypatch,
+):
+    """Реестровая сущность с 404/400 — не «покрыта», а недоступна построчно."""
+    monkeypatch.setattr(
+        audit, "load_doc_types",
+        lambda: {"doc_a": {"entity": "Document_A", "title": "A"}},
+    )
+    fake = _FakeData()
+    fake.set_entity("Document_A", not_found=True)
+    fake.set_journal([_journal_row("Document_A")])
+    fc = _FakeClient(fake)
+
+    report = audit.verify_journal_coverage(
+        _BASE, "2026-01-01", "2026-01-31", client=fc.client
+    )
+
+    assert report["covered"] == 0
+    assert report["coverage"] == 0.0
+    assert report["unscannable"] == ["Document_A"]
+    assert report["unscannable_rows"] == 1
+    assert "НЕДОСТУПНО ДЛЯ ПОСТРОЧНОГО АУДИТА" in (
+        audit.format_journal_coverage(report)
+    )
+
+
 def test_verify_journal_coverage_unavailable():
     """Без журнала операций покрытие не проверяется (available=False)."""
     fake = _FakeData()  # журнал не опубликован
@@ -997,14 +1032,17 @@ def test_main_requires_period_unless_listing():
     assert exc.value.code == 2
 
 
-def _coverage_report(uncovered):
+def _coverage_report(uncovered, unscannable=None):
+    unscannable = unscannable or []
+    problems = len(uncovered) + len(unscannable)
     return {
         "available": True, "base_name": "Покрытие Тест",
         "base_url": "https://c.example/a/1",
         "period_start": "2026-01-01", "period_end": "2026-01-31",
-        "total": 3, "covered": 3 - len(uncovered),
-        "coverage": (3 - len(uncovered)) / 3, "manual": 0, "routine": 0,
+        "total": 3, "covered": 3 - problems,
+        "coverage": (3 - problems) / 3, "manual": 0, "routine": 0,
         "types": [], "uncovered": uncovered,
+        "unscannable": unscannable, "unscannable_rows": len(unscannable),
     }
 
 
@@ -1039,7 +1077,23 @@ def test_main_verify_coverage_returns_1_on_hole(monkeypatch, capsys):
     assert rc == 1
     assert "дыры покрытия" in captured.out
     assert "Catalog_X" in captured.out
-    assert "баз с дырами" in captured.err
+    assert "баз с проблемами" in captured.err
+
+
+def test_main_verify_coverage_returns_1_on_unscannable(monkeypatch, capsys):
+    db.insert_base("Покрытие Скан", "https://c.example/a/3", "u", "p")
+    monkeypatch.setattr(
+        audit, "verify_journal_coverage",
+        lambda *a, **k: _coverage_report([], ["Document_A"]),
+    )
+
+    rc = audit.main([
+        "--verify-coverage", "--base", "Покрытие Скан",
+        "--start", "2026-01-01", "--end", "2026-01-31",
+    ])
+
+    assert rc == 1
+    assert "баз с проблемами" in capsys.readouterr().err
 
 
 def test_main_verify_coverage_requires_period():

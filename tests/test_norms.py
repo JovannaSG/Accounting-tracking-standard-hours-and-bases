@@ -13,8 +13,8 @@ def clean_db():
 
 def test_seed_adds_all_norm_keys(clean_db):
     inserted = seed_default_norms(sno="УСН «Доходы»")
-    assert inserted == 33
-    assert db.count_norms() == 33
+    assert inserted == 37
+    assert db.count_norms() == 37
 
     travel = db.get_norm(doc_type="advance_report_travel")
     assert travel["norm_hours"] == 0.375
@@ -40,9 +40,9 @@ def test_seed_adds_all_norm_keys(clean_db):
 
 
 def test_seed_is_idempotent(clean_db):
-    assert seed_default_norms() == 33
+    assert seed_default_norms() == 37
     assert seed_default_norms() == 0
-    assert db.count_norms() == 33
+    assert db.count_norms() == 37
 
 
 def test_seed_preserves_admin_hours_and_updates_title(clean_db):
@@ -77,3 +77,10 @@ def test_default_hours_cover_all_doc_types(clean_db):
     doc_types = load_doc_types()
     missing = [k for k in doc_types if k not in DEFAULT_NORMS_HOURS]
     assert missing == []
+
+def test_seed_includes_authorized_capital_formation(clean_db):
+    """Формирование уставного капитала — в реестре и с нормой по умолчанию."""
+    seed_default_norms()
+    norm = db.get_norm(doc_type="authorized_capital_formation")
+    assert norm["entity"] == "Document_ФормированиеУставногоКапитала"
+    assert norm["norm_hours"] == 0.15

@@ -351,11 +351,26 @@ class OneCClient:
 
     def entity_properties(self, entity: str) -> set[str]:
         """
-        Имена реквизитов сущности из локального снимка odata_schema.json.
+        Имена реквизитов сущности.
 
-        Снимок позволяет выбирать только доступные поля и не проваливаться
-        в 400-fallback, из-за которого терялись реквизиты организации и автора.
+        Предпочитает живой $metadata текущей базы (кэш на клиенте) — позволяет
+        корректно строить $select даже для сущностей, отсутствующих в
+        статичном снимке core/odata_schema.json. Статичный снимок используется
+        как fallback при недоступности live-$metadata.
         """
+        cache = getattr(self, "_metadata_props_cache", None)
+        if cache is None:
+            try:
+                cache = self.fetch_metadata_entity_properties()
+                self._metadata_props_cache = cache
+            except Exception:
+                cache = {}
+                self._metadata_props_cache = cache
+        entry = cache.get(entity) if isinstance(cache, dict) else None
+        if isinstance(entry, dict) and isinstance(entry.get("properties"), set):
+            props = entry.get("properties") or set()
+            if props:
+                return set(props)
         ent = _load_schema().get("entities", {}).get(entity)
         if not ent:
             return set()
@@ -408,18 +423,24 @@ class OneCClient:
         Потребитель (аудит) обрабатывает каждую строку и отпускает — память
         не растёт с объёмом данных. Первый запрос пробует полный ``$select``;
         если 1С отвечает 400/500 (несовместимость полей), выполняется повтор
-        с минимальным набором из трёх полей, а сущность фиксируется в
+        с минимальным набором (``Ref_Key, Date``), а сущность фиксируется в
         ``self._degraded_entities`` — аудит помечает такую выгрузку как
         data-poor. Если ошибка приходит ПОСЛЕ первого успешного запроса —
         она пробрасывается напрямую (иначе строки задвоились бы).
         """
         if select is None:
             available = self.entity_properties(entity)
-            fields = (
-                [f for f in self._COMMON_FIELDS if f in available]
-                if available
-                else list(self._COMMON_FIELDS)
-            )
+            if available:
+                fields = [f for f in self._COMMON_FIELDS if f in available]
+            else:
+                fields = list(self._COMMON_FIELDS)
+            # Если даже базовые служебные поля (кроме Ref_Key/Date) не
+            # пересекаются с живым $metadata — оставим универсальный минимум.
+            if available and not fields:
+                fields = [f for f in ("Ref_Key", "Date") if f in available] or [
+                    "Ref_Key",
+                    "Date",
+                ]
         else:
             fields = list(select)
 
@@ -438,14 +459,39 @@ class OneCClient:
             if yielded or not self._is_select_error(str(e)):
                 raise
             self._degraded_entities.add(entity)
-            fields = list(self._COMMON_FIELDS[:3])
-            endpoint, params = self._documents_request(
-                entity, period_start, period_end, fields, page_size
-            )
-            for page in self._paginate_pages(
-                endpoint, params, pause=pause, on_page=on_page
-            ):
-                yield from page.get("value", [])
+            available = self.entity_properties(entity)
+            if available:
+                fallback = [f for f in ("Ref_Key", "Date") if f in available]
+                if not fallback:
+                    fallback = ["Ref_Key"]
+                # Подстрахуемся: добавим Number только если реально есть
+                if "Number" in available and "Number" not in fallback:
+                    fallback = ["Ref_Key", "Date", "Number"]
+            else:
+                fallback = ["Ref_Key", "Date"]
+            # Если минимальный набор тоже не работает — пробуем строго
+            # универсальный минимум без опоры на снапшот
+            try:
+                endpoint, params = self._documents_request(
+                    entity, period_start, period_end, fallback, page_size
+                )
+                for page in self._paginate_pages(
+                    endpoint, params, pause=pause, on_page=on_page
+                ):
+                    yield from page.get("value", [])
+                return
+            except ValueError as e2:
+                if not self._is_select_error(str(e2)):
+                    raise
+                # Крайний случай: только Ref_Key/Date вне зависимости от снапшота
+                fallback2 = ["Ref_Key", "Date"]
+                endpoint, params = self._documents_request(
+                    entity, period_start, period_end, fallback2, page_size
+                )
+                for page in self._paginate_pages(
+                    endpoint, params, pause=pause, on_page=on_page
+                ):
+                    yield from page.get("value", [])
 
     def fetch_documents(
         self,

@@ -253,6 +253,27 @@ def test_idle_timeout_disabled_by_zero(clean_db, monkeypatch):
     assert at.session_state["login"] == "admin"
 
 
+def test_idle_timeout_defaults_to_60(monkeypatch):
+    from app import ui as ui_mod
+
+    monkeypatch.delenv("UI_IDLE_TIMEOUT_MIN", raising=False)
+    assert ui_mod.idle_timeout_minutes() == 60
+
+
+def test_activity_refreshes_idle_timestamp(clean_db, monkeypatch):
+    import time as _time
+
+    db.upsert_user("admin", auth.ROLE_ADMIN, auth.hash_password("secret"), [])
+    monkeypatch.setenv("UI_IDLE_TIMEOUT_MIN", "60")
+    at = _run_app()
+    _login(at, "admin", "secret")
+    old = _time.time() - 30 * 60
+    at.session_state["login_ts"] = old
+    at.run()
+    assert at.session_state["login"] == "admin"
+    assert at.session_state["login_ts"] > old + 60
+
+
 def test_report_variants_and_sort_widgets(clean_db):
     from app import ui as ui_mod
 

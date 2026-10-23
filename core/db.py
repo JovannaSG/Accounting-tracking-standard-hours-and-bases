@@ -1738,6 +1738,28 @@ def list_audit_runs(base_url: str | None = None) -> list[dict]:
         conn.close()
 
 
+def cleanup_stale_runs() -> int:
+    """Помечает незавершённые прогоны как FAILED (процесс уже не идёт).
+
+    Вызывается из UI, когда блокировка аудита свободна: в этот момент ни
+    один процесс не может писать в ``audit_runs``, поэтому все оставшиеся
+    ``RUNNING`` — жертвы падения/перезапуска контейнера. Чанки не трогаем:
+    их состояние нужно для продолжения с прерванного места.
+    """
+
+    conn = _audit_conn()
+    try:
+        now = datetime.now().isoformat(timespec="seconds")
+        cursor = conn.execute(
+            "UPDATE audit_runs SET status=?, finished_at=? WHERE status = ?",
+            (AUDIT_RUN_FAILED, now, AUDIT_RUN_PENDING),
+        )
+        conn.commit()
+        return int(cursor.rowcount or 0)
+    finally:
+        conn.close()
+
+
 def get_audit_run(run_id: int) -> dict:
     conn = _audit_conn()
     try:

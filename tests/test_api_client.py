@@ -180,9 +180,88 @@ def test_fetch_documents_iter_degrades_400_to_minimal_select(monkeypatch):
 
     assert len(seen_selects) == 2
     assert len(seen_selects[0]) > 3
-    assert seen_selects[1] == client._COMMON_FIELDS[:3]
+    assert seen_selects[1] == ["Ref_Key", "Date"]
     assert rows == [{"Ref_Key": "mb1"}, {"Ref_Key": "mb2"}]
     assert client._degraded_entities == {"Document_НеизвестнаяСущность"}
+
+
+def test_entity_properties_prefers_live_metadata_and_caches(monkeypatch):
+    """Поля берутся из живого $metadata базы, а не из статичного снапшота."""
+    monkeypatch.setattr(
+        "core.api_client._load_schema",
+        lambda: {"entities": {"Document_X": {"properties": ["Ref_Key", "Number"]}}},
+    )
+    client = _client()
+    xml = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<edmx:Edmx xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx" '
+        'Version="1.0"><edmx:DataServices>'
+        '<Schema xmlns="http://schemas.microsoft.com/ado/2008/09/edm" '
+        'Namespace="StandardODATA">'
+        '<EntityType Name="Document_X">'
+        '<Property Name="Ref_Key"/><Property Name="Date"/>'
+        '<Property Name="Организация_Key"/>'
+        '</EntityType></Schema></edmx:DataServices></edmx:Edmx>'
+    ).encode("utf-8")
+    calls = []
+
+    class _Meta:
+        content = xml
+
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, timeout=None):
+        calls.append(url)
+        return _Meta()
+
+    client.session.get = fake_get
+
+    props = {"Ref_Key", "Date", "Организация_Key"}
+    assert client.entity_properties("Document_X") == props
+    assert client.entity_properties("Document_X") == props
+    assert len(calls) == 1  # живой $metadata кэшируется на клиенте
+
+
+def test_numberless_entity_select_skips_missing_field(monkeypatch):
+    """Сущность без Number не должна попадать в $select (иначе 400)."""
+    from urllib.parse import parse_qs, urlparse
+
+    monkeypatch.setattr("core.api_client._load_schema", lambda: {"entities": {}})
+    client = _client()
+    xml = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<edmx:Edmx xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx" '
+        'Version="1.0"><edmx:DataServices>'
+        '<Schema xmlns="http://schemas.microsoft.com/ado/2008/09/edm" '
+        'Namespace="StandardODATA">'
+        '<EntityType Name="Document_БезНомера">'
+        '<Property Name="Ref_Key"/><Property Name="Date"/>'
+        '<Property Name="Организация_Key"/>'
+        '</EntityType></Schema></edmx:DataServices></edmx:Edmx>'
+    ).encode("utf-8")
+    seen = []
+
+    class _Meta:
+        content = xml
+
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, params=None, timeout=None):
+        if "/$metadata" in url:
+            return _Meta()
+        fields = parse_qs(urlparse(url).query)["$select"][0].split(",")
+        seen.append(fields)
+        return _FakeResponse({"value": []}, 200, url)
+
+    client.session.get = fake_get
+    list(client.fetch_documents_iter(
+        "Document_БезНомера", "2026-01-01", "2026-01-31"
+    ))
+
+    assert seen == [["Ref_Key", "Date", "Организация_Key"]]
+    assert "Number" not in seen[0]
 
 
 def test_fetch_documents_iter_mid_stream_error_propagates_without_fallback():

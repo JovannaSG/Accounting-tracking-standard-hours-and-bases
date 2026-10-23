@@ -305,9 +305,9 @@ def _store_access_ctx() -> None:
         return
     st.session_state["user_role"] = auth.user_role(login)
     st.session_state["user_allowed_urls"] = auth.user_allowed_urls(login)
-    # Метка входа для таймаута бездействия: ставится один раз при входе
-    if not st.session_state.get("login_ts"):
-        st.session_state["login_ts"] = time.time()
+    # Метка последней активности: обновляется на каждом rerun после проверки
+    # таймаута, поэтому UI_IDLE_TIMEOUT_MIN — это именно время бездействия.
+    st.session_state["login_ts"] = time.time()
 
 
 def _render_login_form() -> None:
@@ -1683,7 +1683,9 @@ def _audit_company_totals(rows: list[dict]):
 
 
 def render_audit_tab():
-    """Вкладка «Аудит»: запуск фонового обхода и мониторинг (админ)."""
+    """
+    Вкладка «Аудит»: запуск фонового обхода и мониторинг (админ)
+    """
 
     st.title("Глубокий аудит данных")
     if not _is_admin():
@@ -1707,6 +1709,20 @@ def render_audit_tab():
             f"Аудит выполняется: {_audit_scope_label(info.get('scope'))}, "
             f"PID {pid}{period}."
         )
+        log_tail = audit_runner.read_log_tail(
+            max_lines=20, offset=int(info.get("log_offset") or 0)
+        )
+        progress = audit_runner.parse_batch_progress(log_tail)
+        if progress:
+            current, total, base_name = progress
+            st.progress(
+                min(1.0, current / total),
+                text=f"База {current} из {total} — {base_name}",
+            )
+        elif info.get("scope") == "single":
+            st.progress(0.0, text="Аудит одной базы выполняется…")
+        else:
+            st.progress(0.0, text="Подготовка и сбор данных…")
         if st.button("Остановить аудит", key="audit_stop"):
             audit_runner.stop()
             st.session_state["audit_notice"] = (
@@ -1714,6 +1730,8 @@ def render_audit_tab():
                 "повторный запуск продолжит с прерванного чанка."
             )
             st.rerun()
+        with st.expander("Лог фонового аудита", expanded=False):
+            st.code(log_tail or "(лог пуст)", language="text")
     else:
         st.success("Аудит не выполняется.")
 
@@ -1730,6 +1748,13 @@ def render_audit_tab():
             "База", list(base_options) or ["—"],
             key="audit_base",
             disabled=(scope_label != "Одна база"),
+        )
+        chunk_mode_label = st.radio(
+            "Режим обработки", ("Помесячно", "За весь период"),
+            horizontal=True, key="audit_chunk_mode",
+            help="«Помесячно» создаёт точки для возобновления при ошибке. \
+                «За весь период» делает один запрос на вид документа — \
+                работает радикально быстрее на базах с низкой активностью."
         )
         col_start, col_end = st.columns(2)
         period_start = col_start.date_input(
@@ -1749,6 +1774,11 @@ def render_audit_tab():
     if submitted:
         try:
             start_iso, end_iso = period_start.isoformat(), period_end.isoformat()
+            if chunk_mode_label == "За весь период (быстро)":
+                chunk_mode = "period"
+            else:
+                chunk_mode = "month"
+
             if scope_label == "Одна база":
                 chosen = base_options.get(base_name)
                 if not chosen:
@@ -1757,11 +1787,13 @@ def render_audit_tab():
                     "single", start_iso, end_iso,
                     base_filter=chosen["name"],
                     include_unmapped=include_unmapped,
+                    chunk_mode=chunk_mode
                 )
             else:
                 audit_runner.launch(
                     "all", start_iso, end_iso,
                     include_unmapped=include_unmapped,
+                    chunk_mode=chunk_mode
                 )
         except (ValueError, audit.AuditBusyError) as e:
             st.error(f"Не удалось запустить аудит: {e}")
@@ -1776,6 +1808,7 @@ def render_audit_tab():
         st.rerun()
 
     rows = audit.audit_summary()
+    hours_rows: list[dict] = []
     if not rows:
         st.info(
             "История аудита пуста. Запустите аудит, чтобы увидеть данные."
@@ -1882,6 +1915,55 @@ def render_audit_tab():
             st.dataframe(
                 _audit_summary_table(rows), use_container_width=True
             )
+
+            zero_bases = sorted({
+                str(r.get("base_name") or "")
+                for r in hours_rows
+                if not int(r.get("operations") or 0)
+            })
+            if zero_bases:
+                preview = ", ".join(zero_bases[:10])
+                if len(zero_bases) > 10:
+                    preview += f" и ещё {len(zero_bases) - 10}"
+                st.warning(
+                    f"Нулевая активность (0 операций за последний прогон): "
+                    f"{preview}"
+                )
+
+            st.markdown("**Покрытие журнала операций**")
+            if scope_label != "Одна база":
+                st.caption(
+                    "Выберите «Одна база», чтобы проверить покрытие журнала "
+                    "(read-only, без записи в историю аудита)."
+                )
+            else:
+                chosen = base_options.get(base_name)
+                coverage_key = f"audit_coverage_{base_name}"
+                if st.button(
+                    "Проверить покрытие журнала",
+                    key="audit_coverage_run",
+                    disabled=running or chosen is None,
+                ):
+                    start = st.session_state.get("audit_start")
+                    end = st.session_state.get("audit_end")
+                    if chosen is not None and start and end:
+                        with st.spinner("Читаю журнал операций…"):
+                            st.session_state[coverage_key] = (
+                                audit.verify_journal_coverage(
+                                    chosen, start.isoformat(), end.isoformat()
+                                )
+                            )
+                coverage = st.session_state.get(coverage_key)
+                if coverage:
+                    st.code(
+                        audit.format_journal_coverage(coverage),
+                        language="text",
+                    )
+                    if coverage.get("unscannable") or coverage.get("uncovered"):
+                        st.error(
+                            "Есть записи журнала, не покрытые построчным "
+                            "аудитом: см. строки «НЕДОСТУПНО…» / «НЕ ПОКРЫТО»."
+                        )
 
     if st.checkbox("Показать последние строки лога", key="audit_show_log"):
         tail = audit_runner.read_log_tail()
@@ -2106,11 +2188,11 @@ def idle_timeout_minutes() -> int:
     Настраивается переменной окружения UI_IDLE_TIMEOUT_MIN.
     """
 
-    raw = os.environ.get("UI_IDLE_TIMEOUT_MIN", "30")
+    raw = os.environ.get("UI_IDLE_TIMEOUT_MIN", "60")
     try:
         return max(0, int(str(raw).strip()))
     except (TypeError, ValueError):
-        return 30
+        return 60
 
 
 def _check_idle_timeout() -> bool:

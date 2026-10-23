@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from core import audit, audit_runner, config
+from core import audit, audit_runner, config, db
 
 _HELPER = (
     "import fcntl,os,sys,time\n"
@@ -174,3 +174,59 @@ def test_read_log_tail(paths):
     with open(paths["log"], "w", encoding="utf-8") as f:
         f.write("one\ntwo\nthree\n")
     assert audit_runner.read_log_tail(max_lines=2) == "two\nthree\n"
+
+
+def test_read_log_tail_skips_previous_run(paths):
+    with open(paths["log"], "w", encoding="utf-8") as f:
+        f.write("old run\n[145/145] Старая база\n")
+    offset = os.path.getsize(paths["log"])
+    with open(paths["log"], "a", encoding="utf-8") as f:
+        f.write("[1/2] Новая база\n")
+    assert audit_runner.read_log_tail(offset=offset) == "[1/2] Новая база\n"
+
+
+def test_parse_batch_progress_uses_last_match():
+    text = "[1/2] Старая\n[1/3] Первая\n[2/3] Вторая"
+    assert audit_runner.parse_batch_progress(text) == (2, 3, "Вторая")
+    assert audit_runner.parse_batch_progress("no progress") is None
+    assert audit_runner.parse_batch_progress("[1/0] broken") is None
+
+
+def _insert_run(base_url: str, status: str) -> int:
+    conn = db._audit_conn()
+    try:
+        conn.execute(
+            "INSERT INTO audit_runs (base_url, period_start, period_end, "
+            "include_unmapped, status, created_at) "
+            "VALUES (?, '2026-01-01', '2026-01-31', 0, ?, '2026-01-01T00:00:00')",
+            (base_url, status),
+        )
+        conn.commit()
+        return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_status_marks_stale_runs_failed(paths):
+    stale_id = _insert_run("https://example/1", db.AUDIT_RUN_PENDING)
+    done_id = _insert_run("https://example/2", db.AUDIT_RUN_COMPLETED)
+
+    assert audit_runner.status()["running"] is False
+
+    stale = db.get_audit_run(stale_id)
+    assert stale["status"] == db.AUDIT_RUN_FAILED
+    assert stale["finished_at"]
+    done = db.get_audit_run(done_id)
+    assert done["status"] == db.AUDIT_RUN_COMPLETED
+    assert done["finished_at"] is None
+
+
+def test_status_keeps_running_rows_while_lock_held(paths):
+    run_id = _insert_run("https://example/3", db.AUDIT_RUN_PENDING)
+    fd = _hold_lock(paths["lock"])
+    try:
+        assert audit_runner.status()["running"] is True
+        assert db.get_audit_run(run_id)["status"] == db.AUDIT_RUN_PENDING
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
