@@ -35,7 +35,8 @@ _DEFAULT_RETRY_TOTAL = 5
 
 
 class EntityNotFoundError(ValueError):
-    """Сущность отсутствует в базе (OData 404).
+    """
+    Сущность отсутствует в базе (OData 404).
 
     Не сетевой сбой и не ошибка данных: у конкретного тенанта может быть не
     активирован подсистемный контур (ГТД, зарплата и т.п.). Наследует
@@ -46,7 +47,10 @@ class EntityNotFoundError(ValueError):
 
 
 def _load_schema() -> dict[str, Any]:
-    """Лениво читает снимок odata_schema.json (офлайн-выбор полей выгрузки)."""
+    """
+    Лениво читает снимок odata_schema.json (офлайн-выбор полей выгрузки)
+    """
+
     global _schema_cache
     if _schema_cache is None:
         with _schema_lock:
@@ -76,7 +80,16 @@ class OneCClient:
     def __init__(self, base_url: str, username: str, password: str) -> None:
         self.base_url = base_url.rstrip('/')
         self.session = requests.Session()
-        self.session.auth = HTTPBasicAuth(username, password)
+        if isinstance(username, str):
+            safe_username = username.encode("utf-8")
+        else:
+            safe_username = username
+        if isinstance(password, str):
+            safe_password = password.encode('utf-8')
+        else:
+            safe_password = password
+
+        self.session.auth = HTTPBasicAuth(safe_username, safe_password)
         self.session.headers.update({"Accept": "application/json"})
 
         retries = Retry(
@@ -84,10 +97,13 @@ class OneCClient:
             connect=_DEFAULT_RETRY_TOTAL,
             read=_DEFAULT_RETRY_TOTAL,
             status=_DEFAULT_RETRY_TOTAL,
-            backoff_factor=1.0,      # экспонента 1, 2, 4, 8, 16 c
+            # экспонента 1, 2, 4, 8, 16 c
+            backoff_factor=1.0,
             backoff_max=32.0,
-            backoff_jitter=1.0,      # рассинхронизация повторов (no thundering herd)
-            retry_after_max=30.0,    # кап для Retry-After от 1С:Фреш
+            # рассинхронизация повторов (no thundering herd)
+            backoff_jitter=1.0,
+            # кап для Retry-After от 1С:Фреш
+            retry_after_max=30.0,
             status_forcelist=(429, 500, 502, 503, 504),
             allowed_methods=("GET",),
         )
@@ -108,27 +124,29 @@ class OneCClient:
         self._degraded_entities: set[str] = set()
         # Кэш типов документов из журнала операций по периоду (см.
         # fetch_journal_document_types): журнал сканируется максимум раз.
-        self._journal_types_cache: dict[
-            tuple[str, str], dict[str, int] | None
-        ] = {}
+        self._journal_types_cache: dict[tuple[str, str], dict[str, int] | None] = {}
 
     @staticmethod
     def _is_select_error(message: str) -> bool:
-        """Признак 400/500 — фолбэк на минимальный $select (как было раньше).
+        """
+        Признак 400/500 — фолбэк на минимальный $select (как было раньше).
 
         400 возникает из-за несовместимого $select; исключённый 500 обычно
         был следствием кривого кодирования $filter (исправлен через quote) и
         теперь в основном уходит в Retry, но значение из бэк-офиса 1С тоже
         остаётся поводом для деградации (обратная совместимость).
         """
+
         return "400" in message or "500" in message
 
     def _request_page(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
-        """Один GET страницы OData с маппингом ошибок в ValueError.
+        """
+        Один GET страницы OData с маппингом ошибок в ValueError.
 
         Повторы 429/5xx выполняет urllib3.Retry на уровне сессии; сюда
         приходит либо успешный ответ, либо ошибка ПОСЛЕ исчерпания повторов.
         """
+
         try:
             response = self.session.get(endpoint, params=params, timeout=30)
             response.raise_for_status()
