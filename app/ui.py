@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import re
@@ -27,7 +28,7 @@ from core.calculator import (
 from core.reporters import export_excel
 from core.employees import unmapped_users, linked_employee, filter_by_employee
 
-PERIOD_MODES = {
+PERIOD_MODES: dict[str, str] = {
     "Месяц": "month",
     "Квартал": "quarter",
     "Год": "year",
@@ -94,7 +95,8 @@ def apply_filters(report: pd.DataFrame, filters: dict) -> pd.DataFrame:
         # Колонка может отсутствовать, если её нет в выбранной группировке
         if values and col in filtered.columns:
             filtered.drop(
-                filtered.index[~filtered[col].isin(values)], inplace=True
+                filtered.index[~filtered[col].isin(values)],
+                inplace=True
             )
 
     _isin("Клиент", filters.get("client"))
@@ -215,7 +217,9 @@ def render_sidebar_filters(report: pd.DataFrame) -> dict:
 
 
 def _active_filters_summary(filters: dict) -> str:
-    """Короткая сводка применяемых отборов для сайдбара."""
+    """
+    Короткая сводка применяемых отборов для сайдбара
+    """
 
     labels: dict[str, tuple] = {
         "client": ("Клиент", None),
@@ -272,7 +276,9 @@ def _permission_flag(flag: str) -> bool:
 
 
 def _permission_flags_for_session() -> dict[str, bool]:
-    """Полный набор флагов текущей сессии (для роутинга вкладок)."""
+    """
+    Полный набор флагов текущей сессии (для роутинга вкладок)
+    """
 
     user = _current_user()
     if user is None:
@@ -441,8 +447,14 @@ def select_base() -> dict:
     )
     user = st.sidebar.text_input("Логин OData", value="odata.user")
     pwd = st.sidebar.text_input("Пароль OData", type="password")
-    return {"id": None, "name": url, "url": url, "login": user,
-            "password": pwd, "sno": ""}
+    return {
+        "id": None,
+        "name": url,
+        "url": url,
+        "login": user,
+        "password": pwd,
+        "sno": ""
+    }
 
 
 def period_bounds_for_month(month: str, year: int) -> tuple[str, str, str]:
@@ -459,7 +471,10 @@ def period_bounds_for_month(month: str, year: int) -> tuple[str, str, str]:
 def select_period() -> tuple[str, str, str]:
     st.sidebar.header("Период")
     mode = st.sidebar.selectbox(
-        "Период", list(PERIOD_MODES.keys()), index=0, key="period_mode"
+        "Период",
+        list(PERIOD_MODES.keys()),
+        index=0,
+        key="period_mode"
     )
     today = pd.Timestamp.today()
     if mode == "Месяц":
@@ -524,11 +539,16 @@ def run_report(
     """
 
     allow = base.get("active_doc_types") or []
-    types = [k for k in selected_types if k in allow] if allow else list(selected_types)
+    if allow:
+        types: list = [k for k in selected_types if k in allow]
+    else:
+        list(selected_types)
 
     client = OneCClient(base["url"], base["login"], base["password"])
     raw = fetch_documents(
-        client, period_start, period_end, types,
+        client,
+        period_start, period_end,
+        types,
         sno=(base.get("sno") or ""),
     )
     report = build_report(raw, grouping=grouping)
@@ -544,16 +564,20 @@ def render_report_tab(base: dict):
     categories = sorted({
         spec.get("category", "")
         for spec in doc_types.values()
-    }    )
+    })
     selected_cats = st.sidebar.multiselect(
-        "Блок операций", categories, default=categories)
+        "Блок операций",
+        categories,
+        default=categories
+    )
     keys: list = [
         k for k, spec in doc_types.items()
         if spec.get("category") in selected_cats
     ]
 
     variant = st.sidebar.selectbox(
-        "Вариант отчёта (§9.3)", list(REPORT_VARIANTS.keys()),
+        "Вариант отчёта (§9.3)",
+        list(REPORT_VARIANTS.keys()),
         index=0, key="report_variant"
     )
     v_spec = REPORT_VARIANTS.get(variant, {})
@@ -738,7 +762,11 @@ def render_report_tab(base: dict):
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     with col_clear:
-        if st.button("Очистить отчёт", key="clear_report_btn", use_container_width=True):
+        if st.button(
+            "Очистить отчёт",
+            key="clear_report_btn",
+            use_container_width=True
+        ):
             st.session_state.pop("last_result", None)
             st.rerun()
 
@@ -921,12 +949,16 @@ _DOC_TYPE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 # Префиксы сущностей 1С, которые убираются из имени при подсказке title.
 _ENTITY_PREFIXES: tuple[str, ...] = (
-    "InformationRegister_", "AccumulationRegister_", "Document_", "Catalog_",
+    "InformationRegister_", "AccumulationRegister_",
+    "Document_", "Catalog_",
 )
 
 
 def _scan_cell(record: dict, key: str) -> str:
-    """Значение ячейки data_editor как непустая строка (NaN/None -> '')."""
+    """
+    Значение ячейки data_editor как непустая строка (NaN/None -> '')
+    """
+
     value = record.get(key)
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return ""
@@ -934,11 +966,13 @@ def _scan_cell(record: dict, key: str) -> str:
 
 
 def _render_registry_scanner() -> None:
-    """Сканирование реестра донорской базы: только чтение, добавление новое.
+    """
+    Сканирование реестра донорской базы: только чтение, добавление новое.
 
     Никогда не перезаписывает существующие нормы — это делает
     db.insert_discovered_norm() (ON CONFLICT DO NOTHING).
     """
+
     st.markdown("---")
     st.subheader("Сканирование реестра")
     st.caption(
@@ -1141,12 +1175,14 @@ def _render_registry_scanner() -> None:
 
 
 def _render_manifest_snippets(snippets: dict[str, dict]) -> None:
-    """Готовый блок для core/doc_types.json по успешно добавленным видам.
+    """
+    Готовый блок для core/doc_types.json по успешно добавленным видам.
 
     Файл намеренно НЕ изменяется программно: core/doc_types.json под
     версионным контролем, и запись в него из запущенного Streamlit
     неминуемо конфликтует при следующем git pull.
     """
+
     if not snippets:
         return
     st.warning(
@@ -1161,9 +1197,12 @@ def _render_manifest_snippets(snippets: dict[str, dict]) -> None:
 
 
 def _build_scan_diff(
-    donor: dict, props: dict, entity_sets: dict | None = None
+    donor: dict,
+    props: dict,
+    entity_sets: dict | None = None
 ) -> list[dict]:
-    """Сущности донора, которых нет в манифесте core/doc_types.json.
+    """
+    Сущности донора, которых нет в манифесте core/doc_types.json.
 
     Предлагаются ТОЛЬКО документы:
       - имя начинается с ``Document_`` (Track 2: denylist к Document_*);
@@ -1187,6 +1226,7 @@ def _build_scan_diff(
     введённому ключу норма уже есть, её пропустит insert_discovered_norm()
     (ON CONFLICT DO NOTHING) — правило «пропустить, если есть».
     """
+
     from core.norms import load_doc_types
 
     doc_types = load_doc_types()
@@ -1195,7 +1235,7 @@ def _build_scan_diff(
         for spec in (doc_types or {}).values()
         if spec and spec.get("entity")
     }
-    known = {n["doc_type"] for n in db.list_norms(active_only=False)}
+    known: set = {n["doc_type"] for n in db.list_norms(active_only=False)}
     sets = set(entity_sets or {})
 
     candidates = []
@@ -1229,11 +1269,13 @@ def _build_scan_diff(
 
 
 def _entity_label(entity_name: str) -> str:
-    """Человекочитаемая подсказка для title: имя сущности без префикса 1С.
+    """
+    Человекочитаемая подсказка для title: имя сущности без префикса 1С.
 
     Document_Увольнение -> Увольнение. Администратор правит наименование
     так, чтобы оно совпадало с тем, что реально видно в отчёте.
     """
+
     for prefix in _ENTITY_PREFIXES:
         if entity_name.startswith(prefix):
             return entity_name[len(prefix):] or entity_name
@@ -1241,7 +1283,10 @@ def _entity_label(entity_name: str) -> str:
 
 
 def _has_prop(properties, prefix: str) -> bool:
-    """Есть ли в сущности свойство с данным префиксом (регистронезависимо)."""
+    """
+    Есть ли в сущности свойство с данным префиксом (регистронезависимо)
+    """
+
     needle = prefix.lower()
     for name in properties:
         if str(name).lower() == needle or str(name).lower().startswith(needle):
@@ -1251,7 +1296,8 @@ def _has_prop(properties, prefix: str) -> bool:
 
 # bases: list[dict]
 EMPLOYEE_ROLES: list[str] = [
-    "Бухгалтер по первичке", "Бухгалтер", "Главный бухгалтер",
+    "Бухгалтер по первичке", "Бухгалтер",
+    "Главный бухгалтер",
     "Руководитель проекта", "",
 ]
 
@@ -1574,7 +1620,7 @@ _AUDIT_PROBLEM_COLOR = "#f8d7da"
 _AUDIT_RUNNING_COLOR = "#fff3cd"
 
 # Статусы прогона аудита (значения core.db.AUDIT_RUN_*).
-_AUDIT_STATUS_LABELS = {
+_AUDIT_STATUS_LABELS: dict[str, str] = {
     "RUNNING": "выполняется",
     "COMPLETED": "завершён",
     "FAILED": "ошибка",
@@ -1594,13 +1640,12 @@ def _audit_period_label(row: dict) -> str:
     return "—"
 
 
-def _audit_summary_table(rows: list[dict]):
-    """DataFrame сводки аудита с построчной подсветкой проблем.
-
-    Красный — расхождение/ошибка, жёлтый — идёт прогон, зелёный — чисто.
+def _audit_summary_dataframe(rows: list[dict]) -> pd.DataFrame:
+    """
+    Сырой DataFrame сводки аудита для выгрузки в Excel
     """
 
-    view = pd.DataFrame([
+    return pd.DataFrame([
         {
             "База": r["base_name"],
             "Статус": _AUDIT_STATUS_LABELS.get(str(r.get("run_status")), "—"),
@@ -1616,6 +1661,16 @@ def _audit_summary_table(rows: list[dict]):
         }
         for r in rows
     ])
+
+
+def _audit_summary_table(rows: list[dict]):
+    """
+    DataFrame сводки аудита с построчной подсветкой проблем.
+
+    Красный — расхождение/ошибка, жёлтый — идёт прогон, зелёный — чисто.
+    """
+
+    view = _audit_summary_dataframe(rows)
     problem = pd.Series(
         [bool(r["has_problems"]) or str(r.get("run_status")) == "FAILED"
          for r in rows],
@@ -1641,12 +1696,31 @@ def _audit_summary_table(rows: list[dict]):
     return view.style.apply(_row_color, axis=1)
 
 
-def _audit_hours_table(rows: list[dict], show_base: bool):
-    """Бизнес-сводка аудита: компания / сотрудник / нормочасы."""
+def _export_audit_table_to_excel(
+    hours_df: pd.DataFrame,
+    total_df: pd.DataFrame,
+    tech_df: pd.DataFrame
+) -> bytes:
+    """
+    Генерирует бинарник excel файла с тремя листами
+    """
 
-    data = []
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        hours_df.to_excel(writer, index=False, sheet_name="По сотрудникам")
+        total_df.to_excel(writer, index=False, sheet_name="Итого по компаниям")
+        tech_df.to_excel(writer, index=False, sheet_name="Техническо состояние")
+    return output.getvalue()
+
+
+def _audit_hours_table(rows: list[dict], show_base: bool):
+    """
+    Бизнес-сводка аудита: компания / сотрудник / нормочасы
+    """
+
+    data: list = []
     for r in rows:
-        item = {}
+        item: dict = {}
         if show_base:
             item["База"] = r["base_name"]
         item.update({
@@ -1661,7 +1735,9 @@ def _audit_hours_table(rows: list[dict], show_base: bool):
 
 
 def _audit_company_totals(rows: list[dict]):
-    """Промежуточные итоги по компаниям (без разбивки по базам)."""
+    """
+    Промежуточные итоги по компаниям (без разбивки по базам)
+    """
 
     totals: dict[str, list] = {}
     for r in rows:
@@ -1750,11 +1826,12 @@ def render_audit_tab():
             disabled=(scope_label != "Одна база"),
         )
         chunk_mode_label = st.radio(
-            "Режим обработки", ("Помесячно", "За весь период"),
+            "Режим обработки", ("Помесячно (долго)", "За весь период (быстро)"),
             horizontal=True, key="audit_chunk_mode",
             help="«Помесячно» создаёт точки для возобновления при ошибке. \
                 «За весь период» делает один запрос на вид документа — \
-                работает радикально быстрее на базах с низкой активностью."
+                работает радикально быстрее на базах с низкой активностью. "
+                "При смене режима не используются старые помесячные чекпоинты.",
         )
         col_start, col_end = st.columns(2)
         period_start = col_start.date_input(
@@ -1777,6 +1854,7 @@ def render_audit_tab():
             if chunk_mode_label == "За весь период (быстро)":
                 chunk_mode = "period"
             else:
+                chunk_mode = "month"
                 chunk_mode = "month"
 
             if scope_label == "Одна база":
@@ -1908,12 +1986,26 @@ def render_audit_tab():
                         "Операции есть, но нормочасы равны нулю: проверьте "
                         "активные нормы для этих видов документов."
                     )
+                st.markdown("---")
+                col_export, _ = st.columns(2)
+                with col_export:
+                    excel_data = _export_audit_table_to_excel(
+                        _audit_hours_table(filtered, show_base),
+                        _audit_company_totals(filtered),
+                        _audit_summary_dataframe(rows)
+                    )
+                    st.download_button(
+                        "Скачать Excel (.xlsx)",
+                        excel_data,
+                        file_name=f"audit_summary_{date.today().isoformat()}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="audit_export_btn"
+                    )
 
-        with st.expander(
-            "Техническое состояние аудита (расхождения, gaps, ошибки)"
-        ):
+        with st.expander("Техническое состояние аудита (расхождения, gaps, ошибки)"):
             st.dataframe(
-                _audit_summary_table(rows), use_container_width=True
+                _audit_summary_table(rows),
+                use_container_width=True
             )
 
             zero_bases = sorted({

@@ -127,12 +127,12 @@ def _build_command(
     pause: float,
     include_unmapped: bool,
     python: str | None = None,
-    chunk_mode: str = "month"
+    chunk_mode: str = "month",
 ) -> list[str]:
     cmd: list[str] = [
         python or sys.executable, "-m", "core.audit",
         "--start", start, "--end", end, "--pause", str(pause),
-        "--chunk_mode", chunk_mode
+        "--chunk-mode", str(chunk_mode or "month"),
     ]
     if scope == "all":
         cmd.append("--all-bases")
@@ -262,7 +262,8 @@ def stop(status_file: str | None = None, lock_file: str | None = None) -> bool:
 
 
 def read_log_tail(max_lines: int = 40, offset: int = 0) -> str:
-    """Последние строки лога фонового аудита (для панели UI).
+    """
+    Последние строки лога фонового аудита (для панели UI).
 
     ``offset`` — байтовое смещение начала текущего прогона: так прогресс не
     смешивается с выводом предыдущих запусков. Если файл короче смещения
@@ -282,7 +283,8 @@ def read_log_tail(max_lines: int = 40, offset: int = 0) -> str:
 
 
 def parse_batch_progress(text: str) -> tuple[int, int, str] | None:
-    """Последняя строка прогресса пакетного аудита ``[i/N] имя базы``.
+    """
+    Последняя строка прогресса пакетного аудита ``[i/N] имя базы``.
 
     Берём именно последнее совпадение: лог дописывается, и в хвосте могут
     остаться строки предыдущих баз/прогонов.

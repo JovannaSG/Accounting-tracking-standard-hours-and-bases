@@ -103,7 +103,7 @@ class OneCClient:
             # рассинхронизация повторов (no thundering herd)
             backoff_jitter=1.0,
             # кап для Retry-After от 1С:Фреш
-            retry_after_max=30.0,
+            retry_after_max=30,
             status_forcelist=(429, 500, 502, 503, 504),
             allowed_methods=("GET",),
         )
@@ -170,12 +170,14 @@ class OneCClient:
 
     @staticmethod
     def _page_top(endpoint: str, params: dict[str, Any]) -> int:
-        """Размер страницы из URL ($top) либо из params, иначе 1000.
+        """
+        Размер страницы из URL ($top) либо из params, иначе 1000.
 
         1С:Фреш кладёт $top в URL (в т.ч. в @odata.nextLink); справочники
         передают его в params. Используется для критерия «страница короче
         $top = последняя».
         """
+
         from urllib.parse import parse_qs, urlparse
 
         raw = None
@@ -213,6 +215,7 @@ class OneCClient:
         отчёт использует 0.0, аудит — 0.2). ``on_page`` — хук после каждой
         успешной страницы (аудит считает страницы для checkpoint'а).
         """
+
         params = dict(params or {})
         first = True
         while True:
@@ -282,12 +285,26 @@ class OneCClient:
 
         if include_users:
             logger.info("Предзагрузка справочников (Контрагенты, Пользователи, Организации)...")
+            print(
+                "Предзагрузка справочников (Контрагенты, Пользователи, Организации)...",
+                file=sys.stderr,
+                flush=True
+            )
         else:
             logger.info("Предзагрузка справочников (Контрагенты, Организации)...")
+            print(
+                "Предзагрузка справочников (Контрагенты, Организации)...",
+                file=sys.stderr,
+                flush=True
+            )
 
         def load_cat(cat_name: str, select: list[str]):
-            endpoint = f"{self.base_url}/odata/standard.odata/{cat_name}"
-            params = {"$format": "json", "$select": ",".join(select), "$top": 2000}
+            endpoint: str = f"{self.base_url}/odata/standard.odata/{cat_name}"
+            params: dict = {
+                "$format": "json",
+                "$select": ",".join(select),
+                "$top": 2000
+            }
             try:
                 recs = self._paginate(endpoint, params)
                 with self._cache_lock:
@@ -314,6 +331,11 @@ class OneCClient:
 
         self._catalogs_loaded = True
         logger.info(f"Справочники загружены. В кэше {len(self._guid_to_name)} записей.")
+        print(
+            f"Справочники загружены. В кэше {len(self._guid_to_name)} записей.",
+            file=sys.stderr,
+            flush=True
+        )
 
     def organization_info(self, guid: str | None) -> dict[str, str]:
         """
@@ -358,6 +380,7 @@ class OneCClient:
         статичном снимке core/odata_schema.json. Статичный снимок используется
         как fallback при недоступности live-$metadata.
         """
+
         cache = getattr(self, "_metadata_props_cache", None)
         if cache is None:
             try:
@@ -384,13 +407,15 @@ class OneCClient:
         fields: list[str],
         page_size: int,
     ) -> tuple[str, dict[str, Any]]:
-        """Собирает endpoint + params запроса документов сущности за период.
+        """
+        Собирает endpoint + params запроса документов сущности за период.
 
         Фильтр по дате: ``Date ge datetime'..' and Date le datetime'..'``
         (граница конца дня приклеивается как ``T23:59:59``). Кодирование
         через urllib.parse.quote: requests по умолчанию кодирует пробелы
         как '+', а 1С такой фильтр не парсит (500).
         """
+
         from urllib.parse import quote
 
         period_start_safe = self._start_of_day(period_start)
@@ -418,7 +443,8 @@ class OneCClient:
         page_size: int = 1000,
         on_page: Callable[[], None] | None = None,
     ):
-        """Генератор документов сущности за период (ленивая выгрузка).
+        """
+        Генератор документов сущности за период (ленивая выгрузка).
 
         Потребитель (аудит) обрабатывает каждую строку и отпускает — память
         не растёт с объёмом данных. Первый запрос пробует полный ``$select``;
@@ -428,6 +454,7 @@ class OneCClient:
         data-poor. Если ошибка приходит ПОСЛЕ первого успешного запроса —
         она пробрасывается напрямую (иначе строки задвоились бы).
         """
+
         if select is None:
             available = self.entity_properties(entity)
             if available:
@@ -437,20 +464,25 @@ class OneCClient:
             # Если даже базовые служебные поля (кроме Ref_Key/Date) не
             # пересекаются с живым $metadata — оставим универсальный минимум.
             if available and not fields:
-                fields = [f for f in ("Ref_Key", "Date") if f in available] or [
-                    "Ref_Key",
-                    "Date",
-                ]
+                fields = [
+                    f
+                    for f in ("Ref_Key", "Date")
+                    if f in available
+                ] or ["Ref_Key", "Date",]
         else:
             fields = list(select)
 
         endpoint, params = self._documents_request(
-            entity, period_start, period_end, fields, page_size
+            entity,
+            period_start, period_end,
+            fields,
+            page_size
         )
         yielded = False
         try:
             for page in self._paginate_pages(
-                endpoint, params, pause=pause, on_page=on_page
+                endpoint, params,
+                pause=pause, on_page=on_page
             ):
                 for rec in page.get("value", []):
                     yielded = True
@@ -473,10 +505,14 @@ class OneCClient:
             # универсальный минимум без опоры на снапшот
             try:
                 endpoint, params = self._documents_request(
-                    entity, period_start, period_end, fallback, page_size
+                    entity,
+                    period_start, period_end,
+                    fallback,
+                    page_size
                 )
                 for page in self._paginate_pages(
-                    endpoint, params, pause=pause, on_page=on_page
+                    endpoint, params,
+                    pause=pause, on_page=on_page
                 ):
                     yield from page.get("value", [])
                 return
@@ -486,10 +522,14 @@ class OneCClient:
                 # Крайний случай: только Ref_Key/Date вне зависимости от снапшота
                 fallback2 = ["Ref_Key", "Date"]
                 endpoint, params = self._documents_request(
-                    entity, period_start, period_end, fallback2, page_size
+                    entity,
+                    period_start, period_end,
+                    fallback2,
+                    page_size
                 )
                 for page in self._paginate_pages(
-                    endpoint, params, pause=pause, on_page=on_page
+                    endpoint, params,
+                    pause=pause, on_page=on_page
                 ):
                     yield from page.get("value", [])
 
@@ -508,20 +548,27 @@ class OneCClient:
         Если часть полей недоступна для сущности (400 Bad Request) — повторный
         запрос с минимальным набором полей (фолбэк ниже в ``_iter``).
         """
+
         return list(
-            self.fetch_documents_iter(entity, period_start, period_end, select=select)
+            self.fetch_documents_iter(
+                entity,
+                period_start, period_end,
+                select=select
+            )
         )
 
     def fetch_metadata_entity_sets(self) -> dict[str, str]:
-        """Fetch and parse OData $metadata to extract entity sets.
+        """
+        Fetch and parse OData $metadata to extract entity sets.
 
         Returns:
             dict: mapping of entity set name (e.g., 'Document_РеализацияТоваровУслуг')
                   to its EntityType (e.g., 'StandardODATA.Document_РеализацияТоваровУслуг')
         """
+
         from xml.etree import ElementTree
 
-        url = f"{self.base_url}/odata/standard.odata/$metadata"
+        url: str = f"{self.base_url}/odata/standard.odata/$metadata"
         try:
             response = self.session.get(url, timeout=30)
             response.raise_for_status()
@@ -533,7 +580,10 @@ class OneCClient:
         root = ElementTree.fromstring(response.content)
         sets: dict[str, str] = {}
         for elem in root.iter():
-            tag = elem.tag.rsplit("}", 1)[-1] if "}" in elem.tag else elem.tag
+            if "}" in elem.tag:
+                tag = elem.tag.rsplit("}", 1)[-1]
+            else:
+                tag = elem.tag
             if tag == "EntitySet":
                 name = elem.attrib.get("Name") or elem.attrib.get("name")
                 etype = elem.attrib.get("EntityType") or elem.attrib.get("entityType")
@@ -542,13 +592,15 @@ class OneCClient:
         return sets
 
     def _resolve_operation_journal(self, sets: dict[str, str]) -> str | None:
-        """Имя EntitySet журнала операций (или None, если журнал не опубликован).
+        """
+        Имя EntitySet журнала операций (или None, если журнал не опубликован).
 
         Сначала предпочитаем стандартный ``DocumentJournal_ЖурналОпераций``,
         затем пробуем прочие ``DocumentJournal_*`` и оставляем первый, у
         которого OData отдаёт поле ``Ref_Type`` (машинное имя типа документа).
         """
-        preferred = "DocumentJournal_ЖурналОпераций"
+
+        preferred: str = "DocumentJournal_ЖурналОпераций"
         if preferred in sets:
             return preferred
         for name in sorted(sets):
@@ -558,8 +610,11 @@ class OneCClient:
             try:
                 response = self.session.get(
                     probe,
-                    params={"$format": "json", "$top": 1,
-                            "$select": "Ref_Type"},
+                    params={
+                        "$format": "json",
+                        "$top": 1,
+                        "$select": "Ref_Type"
+                    },
                     timeout=30,
                 )
             except RequestException:
@@ -574,7 +629,8 @@ class OneCClient:
         period_end: str,
         page_size: int = 1000,
     ) -> dict[str, int] | None:
-        """Все типы ссылок журнала операций за период.
+        """
+        Все типы ссылок журнала операций за период.
 
         Возвращает ``{bare_type_name: doc_count}`` для **каждого** ``Ref_Type``
         журнала — включая типы, не начинающиеся с ``Document_`` (например,
@@ -585,7 +641,8 @@ class OneCClient:
         ``None`` — журнал в базе не опубликован/недоступен. Кэшируется по
         периоду: за один прогон сети не больше одного скана.
         """
-        cache_key = (period_start, period_end)
+
+        cache_key: tuple[str, str] = (period_start, period_end)
         if cache_key in self._journal_types_cache:
             return self._journal_types_cache[cache_key]
 
@@ -596,7 +653,10 @@ class OneCClient:
             if journal is not None:
                 fields = ["Date", "Ref", "Ref_Type", "Posted"]
                 endpoint, params = self._documents_request(
-                    journal, period_start, period_end, fields, page_size
+                    journal,
+                    period_start, period_end,
+                    fields,
+                    page_size
                 )
                 counts: dict[str, int] = {}
                 for page in self._paginate_pages(endpoint, params, pause=0.0):
@@ -619,7 +679,8 @@ class OneCClient:
         period_end: str,
         page_size: int = 1000,
     ) -> dict[str, int] | None:
-        """Типы документов из журнала операций за период.
+        """
+        Типы документов из журнала операций за период.
 
         Возвращает ``{entity_name: doc_count}`` только для ``Document_*`` или
         ``None``, если журнал в базе не опубликован/недоступен. Это дешёвая
@@ -629,22 +690,30 @@ class OneCClient:
         соответствуют документам, включая непроведённые. Типы вне
         ``Document_*`` смотрите в ``fetch_journal_ref_types``.
         """
+
         refs = self.fetch_journal_ref_types(
-            period_start, period_end, page_size=page_size
+            period_start, period_end,
+            page_size=page_size
         )
         if refs is None:
             return None
-        return {k: v for k, v in refs.items() if k.startswith("Document_")}
+        return {
+            k: v
+            for k, v in refs.items()
+            if k.startswith("Document_")
+        }
 
     def fetch_metadata_entity_properties(self) -> dict[str, dict[str, set[str]]]:
-        """Fetch and parse OData $metadata to extract EntityType properties.
+        """
+        Fetch and parse OData $metadata to extract EntityType properties.
 
         Returns:
             dict: mapping of EntityType name to dict with 'properties' set
         """
+
         from xml.etree import ElementTree
 
-        url = f"{self.base_url}/odata/standard.odata/$metadata"
+        url: str = f"{self.base_url}/odata/standard.odata/$metadata"
         try:
             response = self.session.get(url, timeout=30)
             response.raise_for_status()
@@ -657,7 +726,10 @@ class OneCClient:
         result: dict[str, dict[str, set[str]]] = {}
         current_entity_type: str | None = None
         for elem in root.iter():
-            tag = elem.tag.rsplit("}", 1)[-1] if "}" in elem.tag else elem.tag
+            if "}" in elem.tag:
+                tag = elem.tag.rsplit("}", 1)[-1]
+            else:
+                tag = elem.tag
             if tag == "EntityType":
                 current_entity_type = elem.attrib.get("Name") or elem.attrib.get("name")
                 if current_entity_type:

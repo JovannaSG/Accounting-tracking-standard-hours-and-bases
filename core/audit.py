@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import logging
 import os
 import signal
 import sys
@@ -25,7 +26,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 
 import openpyxl
@@ -36,6 +37,8 @@ from core.calculator import build_norm_index, resolve_business_row
 from core.fetch import resolve_doc_spec
 from core.norms import load_doc_types
 from core.reporters import BORDER, CENTER, HEADER_FILL, HEADER_FONT
+
+logger = logging.getLogger(__name__)
 
 
 def _is_select_error(message: str) -> bool:
@@ -57,7 +60,8 @@ _TIME = time  # патчится в тестах (паузы между запр
 # Возврат _run_chunk для сущности, отсутствующей в базе (404, не применимо).
 _CHUNK_NOT_APPLICABLE = "NOT_APPLICABLE"
 
-# ====================== ЧАНКИНГ ПО КАЛЕНДАРНЫМ МЕСЯЦАМ ======================
+# ====================== ЧАНКИНГ ======================
+
 
 def _month_chunks(period_start: str, period_end: str) -> list[tuple[str, str]]:
     """
@@ -88,7 +92,21 @@ def _month_chunks(period_start: str, period_end: str) -> list[tuple[str, str]]:
             cur = date(cur.year + 1, 1, 1)
         else:
             cur = date(cur.year, cur.month + 1, 1)
+        if cur > e:
+            break
     return chunks
+
+
+def _chunks(
+    period_start: str,
+    period_end: str,
+    chunk_mode: Literal["month", "period"] = "month",
+) -> list[tuple[str, str]]:
+    """Формирует чанки для аудита в зависимости от режима."""
+
+    if chunk_mode == "period":
+        return [(period_start, period_end)]
+    return _month_chunks(period_start, period_end)
 
 
 # =========================== УТИЛИТЫ ТРАНСПОРТА ==============================
@@ -288,11 +306,38 @@ def run_audit(
 
     entity_specs = _audit_entity_specs(base)
     selected_entities = entities or list(entity_specs)
+    # ABSOLUTELY ALL documents: union with journal Document_* (and metadata fallback)
+    try:
+        if client is not None and entities is None:
+            all_docs = None
+            try:
+                journal_docs = client.fetch_journal_document_types(period_start, period_end)
+                if journal_docs is not None:
+                    all_docs = set(journal_docs.keys())
+            except Exception:
+                all_docs = None
+            if all_docs is None:
+                try:
+                    sets = client.fetch_metadata_entity_sets()
+                    all_docs = {n for n in sets if n.startswith("Document_")}
+                except Exception:
+                    all_docs = None
+            if all_docs:
+                before = len(selected_entities)
+                union_set = set(selected_entities)
+                for ent in all_docs:
+                    if ent not in union_set:
+                        union_set.add(ent)
+                    if ent not in entity_specs:
+                        entity_specs[ent] = [(ent, {"title": ent})]
+                selected_entities = sorted(list(union_set))
+                added = max(0, len(selected_entities) - before)
+                if added:
+                    print(f"Включены все Document_* из источника: +{added} (всего {len(selected_entities)})", file=sys.stderr, flush=True)
+    except Exception as e:
+        logger.debug(f"Не удалось расширить список сущностей: {e}")
 
-    if chunk_mode == "period":
-        chunks = [(period_start, period_end)]
-    else:
-        chunks = _month_chunks(period_start, period_end)
+    chunks = _chunks(period_start, period_end, chunk_mode)
 
     chunk_items: list = [
         (entity, entity_specs.get(entity) or [(entity, {"title": entity})], chunk)
@@ -300,12 +345,16 @@ def run_audit(
         for chunk in chunks
     ]
     summary["chunks_total"] = len(chunk_items)
+    print(f"Аудит: {base.get('name','')} | период {period_start}..{period_end} | сущностей {len(selected_entities)} | чанков {len(chunk_items)} | режим {chunk_mode}", file=sys.stderr, flush=True)
+    logger.info("Аудит: %s | период %s..%s | сущностей %s | чанков %s | режим %s", base.get('name',''), period_start, period_end, len(selected_entities), len(chunk_items), chunk_mode)
 
     by_title = build_norm_index()
     employees = db.list_employees(active_only=True)
 
     try:
-        for entity, entries, (chunk_start, chunk_end) in chunk_items:
+        for idx, (entity, entries, (chunk_start, chunk_end)) in enumerate(chunk_items, 1):
+            print(f"[chunk {idx}/{len(chunk_items)}] {entity} {chunk_start}..{chunk_end}", file=sys.stderr, flush=True)
+            logger.info("[chunk %s/%s] %s %s..%s", idx, len(chunk_items), entity, chunk_start, chunk_end)
             status = _run_chunk(
                 client, run_id, base_url, entity,
                 chunk_start, chunk_end, pause, restart,
@@ -1384,7 +1433,7 @@ def _run_all_bases(
     include_unmapped: bool,
     restart: bool,
     gap_source: str = "auto",
-    chunk_mode: str = "month"
+    chunk_mode: str = "month",
 ) -> int:
     """
     Пакетный обход активных баз: ошибка одной базы не прерывает остальные
@@ -1397,13 +1446,14 @@ def _run_all_bases(
 
     total = len(bases)
     failures = 0
+    print(f"Пакетный аудит: баз {total} | период {start}..{end} | режим {chunk_mode}", file=sys.stderr, flush=True)
     for i, base in enumerate(bases, 1):
-        print(f"[{i}/{total}] {base['name']}")
+        print(f"[{i}/{total}] {base['name']}", flush=True)
         try:
             summary = run_audit(
                 base, start, end, pause=pause,
                 include_unmapped=include_unmapped, restart=restart,
-                gap_source=gap_source, chunk_mode=chunk_mode
+                gap_source=gap_source, chunk_mode=chunk_mode,
             )
             _print_run_summary(summary, out_dir)
         except Exception as e:
@@ -1468,6 +1518,7 @@ def _audit_one(args) -> int:
     Аудит одной базы по аргументам CLI (внутри уже взятой блокировки)
     """
 
+    chunk_mode = getattr(args, "chunk_mode", "month") or "month"
     base = _resolve_base(args.base)
     if base is None:
         names: list = [b["name"] for b in db.list_bases()]
@@ -1477,10 +1528,12 @@ def _audit_one(args) -> int:
             file=sys.stderr,
         )
         return 2
+    print(f"Старт аудита одной базы: {args.base} | {args.start}..{args.end} | режим {chunk_mode}", file=sys.stderr, flush=True)
     summary = run_audit(
         base, args.start, args.end, pause=args.pause,
         include_unmapped=args.include_unmapped, restart=args.restart,
-        gap_source=args.gap_source, chunk_mode=args.chunk_mode
+        gap_source=args.gap_source,
+        chunk_mode=chunk_mode,
     )
     _print_run_summary(summary, args.out)
     return 0
@@ -1622,6 +1675,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # SIGTERM (кнопка «Остановить» в UI) ведёт себя как Ctrl+C — состояние
     # сохраняется, повторный запуск продолжит с прерванного чанка.
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s: %(message)s")
+    print(f"Старт аудита (CLI): база={'all' if args.all_bases else (args.base or '-')} | {args.start}..{args.end} | режим {getattr(args,'chunk_mode','month')}", file=sys.stderr, flush=True)
     _install_sigterm_handler()
     try:
         with _audit_lock(config.AUDIT_LOCK_FILE):
