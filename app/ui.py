@@ -542,7 +542,7 @@ def run_report(
     if allow:
         types: list = [k for k in selected_types if k in allow]
     else:
-        list(selected_types)
+        types = list(selected_types)
 
     client = OneCClient(base["url"], base["login"], base["password"])
     raw = fetch_documents(
