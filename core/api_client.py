@@ -139,7 +139,11 @@ class OneCClient:
 
         return "400" in message or "500" in message
 
-    def _request_page(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
+    def _request_page(
+        self,
+        endpoint: str,
+        params: dict[str, Any]
+    ) -> dict[str, Any]:
         """
         Один GET страницы OData с маппингом ошибок в ValueError.
 
@@ -148,7 +152,7 @@ class OneCClient:
         """
 
         try:
-            response = self.session.get(endpoint, params=params, timeout=30)
+            response = self.session.get(endpoint, params=params, timeout=30)    
             response.raise_for_status()
             return response.json()
         except RetryError as e:
@@ -156,11 +160,16 @@ class OneCClient:
                 f"1С не ответила после {_DEFAULT_RETRY_TOTAL} повторов: {e}"
             ) from e
         except HTTPError as e:
-            status = (
-                e.response.status_code if e.response is not None else None
-            )
+            if e.response is not None:
+                status = e.response.status_code
+            else:
+                status = None
+
             if status == 404:
-                url = e.response.url if e.response is not None else endpoint
+                if e.response is not None:
+                    url = e.response.url
+                else:
+                    url = endpoint
                 raise EntityNotFoundError(
                     f"OData-сущность отсутствует в базе (404): {url}"
                 ) from e
@@ -186,10 +195,12 @@ class OneCClient:
             raw = parse_qs(query).get(r"$top")
         if not raw:
             value = (params or {}).get(r"$top")
-            raw = (
-                value if isinstance(value, list)
-                else ([str(value)] if value else None)
-            )
+            if isinstance(value, list):
+                raw = value
+            elif value is not None:
+                raw = [str(value)]
+            else:
+                raw = None
         if not raw:
             return 1000
         try:
