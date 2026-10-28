@@ -197,6 +197,14 @@ def launch(
     if is_running():
         raise audit.AuditBusyError("Аудит уже выполняется")
 
+    # Сбрасываем старый флаг остановки перед новым запуском
+    flag_path = _lock_file() + ".stop"
+    if os.path.exists(flag_path):
+        try:
+            os.remove(flag_path)
+        except OSError:
+            pass
+
     cmd = _build_command(
         scope,
         base_filter, start, end,
@@ -240,7 +248,10 @@ def launch(
     return info
 
 
-def stop(status_file: str | None = None, lock_file: str | None = None) -> bool:
+def stop(
+    status_file: str | None = None,
+    lock_file: str | None = None
+) -> bool:
     """
     SIGTERM группе процесса аудита. True — сигнал отправлен.
 
@@ -248,16 +259,22 @@ def stop(status_file: str | None = None, lock_file: str | None = None) -> bool:
     ещё удерживается (аудит действительно идёт).
     """
 
-    if not is_running(lock_file):
-        clear_status(status_file)
-        return False
-    pid = read_status(status_file).get("pid")
-    if not pid:
-        return False
+    # Создаем файл-флаг остановки (работает везде)
+    flag_path = _lock_file(lock_file) + ".stop"
     try:
-        os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, ValueError, OSError):
-        return False
+        with open(flag_path, "w", encoding="utf-8") as f:
+            f.write("stop")
+    except OSError:
+        pass
+
+    # Старый метод по PID (оставляем как подстраховку)
+    pid = read_status(status_file).get("pid")
+    if pid:
+        try:
+            import signal
+            os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, ValueError, OSError):
+            pass
     return True
 
 

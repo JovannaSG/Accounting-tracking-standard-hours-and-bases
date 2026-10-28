@@ -1,4 +1,5 @@
-"""Глубокий аудит данных 1С:Фреш (Phase 2-3).
+"""
+Глубокий аудит данных 1С:Фреш (Phase 2-3).
 
 Checkpoint-состояние живёт в отдельной БД ``audit_history.db``
 (``core.db.init_audit_db``), движок строго последователен по базе и
@@ -13,6 +14,7 @@ Checkpoint-состояние живёт в отдельной БД ``audit_hist
 Отчёт пишется в ``exports/audit_*.xlsx`` (листы «Сводка», «Проблемы»,
 «Gaps»).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -32,7 +34,7 @@ from urllib.parse import quote
 import openpyxl
 
 from core import config, db
-from core.api_client import EntityNotFoundError, OneCClient
+from core.api_client import EntityNotFoundError, OneCClient, get_active_entities
 from core.calculator import build_norm_index, resolve_business_row
 from core.fetch import resolve_doc_spec
 from core.norms import load_doc_types
@@ -337,6 +339,17 @@ def run_audit(
     except Exception as e:
         logger.debug(f"Не удалось расширить список сущностей: {e}")
 
+    print(f"Предварительная проверка {len(selected_entities)} таблиц на наличие данных...", file=sys.stderr, flush=True)
+    
+    selected_entities = get_active_entities(
+        client=client, 
+        entities=selected_entities, 
+        start_date=period_start, 
+        end_date=period_end, 
+        # Используем 5 потоков, чтобы избежать ошибки 503 от сервера 1С
+        max_workers=5
+    )
+
     chunks = _chunks(period_start, period_end, chunk_mode)
 
     chunk_items: list = [
@@ -353,6 +366,14 @@ def run_audit(
 
     try:
         for idx, (entity, entries, (chunk_start, chunk_end)) in enumerate(chunk_items, 1):
+            flag_path = config.AUDIT_LOCK_FILE + ".stop"
+            if os.path.exists(flag_path):
+                try:
+                    os.remove(flag_path)
+                except OSError:
+                    pass
+                raise KeyboardInterrupt
+
             print(f"[chunk {idx}/{len(chunk_items)}] {entity} {chunk_start}..{chunk_end}", file=sys.stderr, flush=True)
             logger.info("[chunk %s/%s] %s %s..%s", idx, len(chunk_items), entity, chunk_start, chunk_end)
             status = _run_chunk(
@@ -528,6 +549,16 @@ def _run_chunk(
     def _on_page() -> None:
         nonlocal pages
         pages += 1
+
+        # Проверяем команду на остановку от интерфейса
+        flag_path = config.AUDIT_LOCK_FILE + ".stop"
+        if os.path.exists(flag_path):
+            try:
+                os.remove(flag_path)
+            except OSError:
+                pass
+            # Имитируем SIGTERM для безопасного сохранения чекпоинта
+            raise KeyboardInterrupt
 
     try:
         client._prefetch_catalogs()

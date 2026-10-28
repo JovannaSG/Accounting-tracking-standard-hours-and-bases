@@ -2305,37 +2305,74 @@ def _check_idle_timeout() -> bool:
     return elapsed > minutes * 60
 
 
-@st.fragment(run_every="2s")
+@st.fragment(run_every="3s")
 def render_audit_progress():
     info = audit_runner.status()
-    
+
     if not info.get("running"):
-        # Если аудит только что завершился — делаем один полный перезапуск,
-        # чтобы новые данные появились в основной таблице на экране
         if st.session_state.get("audit_is_running", False):
             st.session_state["audit_is_running"] = False
             st.rerun()
         return
 
     st.session_state["audit_is_running"] = True
-    st.sidebar.markdown("---")
-    st.sidebar.caption("🔄 **Фоновое обновление данных**")
-    
+    st.caption("🔄 **Фоновое обновление данных**")
+
     log_tail = audit_runner.read_log_tail(
-        max_lines=20, offset=int(info.get("log_offset") or 0)
+        max_lines=50, 
+        offset=int(info.get("log_offset") or 0)
     )
     progress = audit_runner.parse_batch_progress(log_tail)
-    
+
+    current_action = "Подготовка и сбор данных..."
+    chunk_info = None
+    latest_error = None
+
+    if log_tail:
+        import re
+        lines = log_tail.splitlines()
+        
+        for line in reversed(lines):
+            if "[ОШИБКА]" in line or "ERROR" in line:
+                latest_error = line.strip()
+                break
+
+        for line in reversed(lines):
+            match = re.search(r"\[chunk (\d+)/(\d+)\]\s+([A-Za-z0-9_]+)", line)
+            if match:
+                chunk_info = (int(match.group(1)), int(match.group(2)))
+                current_action = f"Скачивание: {match.group(3)}"
+                break
+            elif "Предварительная проверка" in line:
+                current_action = "Предварительная проверка пустых таблиц..."
+                break
+
+    # Сначала выводим детальный прогресс по чанкам (сверху)
+    if chunk_info:
+        c_chunk, t_chunk = chunk_info
+        pct = min(1.0, c_chunk / t_chunk) if t_chunk > 0 else 0.0
+        st.progress(pct, text=f"Задания: {c_chunk} из {t_chunk}")
+    else:
+        st.progress(0.0, text="Инициализация...")
+
+    # Под ним выводим прогресс и название текущей базы
     if progress:
         current, total, audit_base_name = progress
-        st.sidebar.progress(
-            min(1.0, current / total),
-            text=f"База {current} из {total}: {audit_base_name}",
-        )
+        if total > 1:
+            st.progress(
+                min(1.0, current / total),
+                text=f"База {current} из {total}: {audit_base_name}"
+            )
+        else:
+            st.markdown(f"**База:** {audit_base_name}")
     elif info.get("scope") == "single":
-        st.sidebar.progress(0.0, text="Аудит одной базы...")
-    else:
-        st.sidebar.progress(0.0, text="Подготовка и сбор данных...")
+        st.markdown("**Аудит одной базы**")
+
+    # Текущее действие и ошибки в самом низу
+    st.caption(f"⏳ {current_action}")
+
+    if latest_error:
+        st.error(f"⚠️ {latest_error}")
 
 
 def main():
@@ -2358,7 +2395,8 @@ def main():
 
     _render_logout_button()
 
-    render_audit_progress()
+    with st.sidebar:
+        render_audit_progress()
 
     base = select_base()
 

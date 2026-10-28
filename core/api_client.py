@@ -63,6 +63,45 @@ def _load_schema() -> dict[str, Any]:
     return _schema_cache
 
 
+def get_active_entities(
+    client,
+    entities,
+    start_date,
+    end_date,
+    max_workers=10
+) -> list:
+    active_entities: list = []
+
+    # Вспомогательная функция для потока
+    def check_entity(entity):
+        is_active = client.has_documents(entity, start_date, end_date)
+        return entity, is_active
+
+    # Запускаем проверку в пуле потоков
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max_workers
+    ) as executor:
+        # Отправляем все сущности в пул
+        future_to_entity: dict = {
+            executor.submit(check_entity, e): e
+            for e in entities
+        }
+
+        # Получаем результаты по мере их готовности (не дожидаясь остальных)
+        for future in concurrent.futures.as_completed(future_to_entity):
+            entity, is_active = future.result()
+            if is_active:
+                active_entities.append(entity)
+            else:
+                print(
+                    f"[{entity}] Таблица пуста, пропускаем",
+                    file=sys.stderr,
+                    flush=True
+                )
+                
+    return active_entities
+
+
 class OneCClient:
     """
     Клиент OData 1С:Фреш.
@@ -138,6 +177,41 @@ class OneCClient:
         """
 
         return "400" in message or "500" in message
+
+    def has_documents(
+        self,
+        entity: str,
+        start_date: str,
+        end_date: str
+    ) -> bool:
+        """
+        Делает сверхбыстрый запрос 1 записи (не помеченной на удаление)
+        для проверки пустоты таблицы
+        """
+
+        from urllib.parse import quote
+        try:
+            start_safe = self._start_of_day(start_date)
+            end_safe = self._end_of_day(end_date)
+            
+            # Строим фильтр с обязательным условием DeletionMark eq false
+            ffilter = (
+                f"Date ge datetime'{start_safe}' "
+                f"and Date le datetime'{end_safe}' "
+                f"and DeletionMark eq false"
+            )
+            
+            endpoint = (
+                f"{self.base_url}/odata/standard.odata/{entity}"
+                f"?$format=json&$select=Ref_Key&$filter={quote(ffilter, safe='')}&$top=1"
+            )
+            
+            data = self._request_page(endpoint, {})
+            return len(data.get("value", [])) > 0
+        except Exception:
+            # При любых сбоях (например, у таблицы нет поля Date или DeletionMark) 
+            # возвращаем True, чтобы безопасно передать таблицу в основной аудит
+            return True
 
     def _request_page(
         self,
