@@ -1676,7 +1676,7 @@ def main(argv: list[str] | None = None) -> int:
     # SIGTERM (кнопка «Остановить» в UI) ведёт себя как Ctrl+C — состояние
     # сохраняется, повторный запуск продолжит с прерванного чанка.
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s: %(message)s")
-    print(f"Старт аудита (CLI): база={'all' if args.all_bases else (args.base or '-')} | {args.start}..{args.end} | режим {getattr(args,'chunk_mode','month')}", file=sys.stderr, flush=True)
+    # print(f"Старт аудита (CLI): база={'all' if args.all_bases else (args.base or '-')} | {args.start}..{args.end} | режим {getattr(args,'chunk_mode','month')}", file=sys.stderr, flush=True)
     _install_sigterm_handler()
     try:
         with _audit_lock(config.AUDIT_LOCK_FILE):

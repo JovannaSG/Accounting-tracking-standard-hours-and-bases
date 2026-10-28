@@ -3,10 +3,11 @@ from core import db
 from core.api_client import OneCClient
 
 # Укажите точное имя базы из дашборда и нужный период
-BASE_NAME = "7;Говса Р.К. ИП"
-START_DATE = "2026-01-01"
-END_DATE = "2026-12-31"
+BASE_NAME = "7;ПРАВОТЕХ ООО"
+START_DATE = "2026-06-01"
+END_DATE = "2026-06-30"
 OUTPUT_FILE = "journal_export.xlsx"
+
 
 def main():
     # Ищем базу в локальной SQLite
@@ -46,6 +47,7 @@ def main():
     df.to_excel(OUTPUT_FILE, index=False)
     
     print(f"Успешно! Сохранено {len(df)} записей в файл {OUTPUT_FILE}")
+
 
 if __name__ == "__main__":
     main()

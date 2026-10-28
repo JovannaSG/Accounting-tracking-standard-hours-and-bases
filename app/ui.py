@@ -2305,6 +2305,39 @@ def _check_idle_timeout() -> bool:
     return elapsed > minutes * 60
 
 
+@st.fragment(run_every="2s")
+def render_audit_progress():
+    info = audit_runner.status()
+    
+    if not info.get("running"):
+        # Если аудит только что завершился — делаем один полный перезапуск,
+        # чтобы новые данные появились в основной таблице на экране
+        if st.session_state.get("audit_is_running", False):
+            st.session_state["audit_is_running"] = False
+            st.rerun()
+        return
+
+    st.session_state["audit_is_running"] = True
+    st.sidebar.markdown("---")
+    st.sidebar.caption("🔄 **Фоновое обновление данных**")
+    
+    log_tail = audit_runner.read_log_tail(
+        max_lines=20, offset=int(info.get("log_offset") or 0)
+    )
+    progress = audit_runner.parse_batch_progress(log_tail)
+    
+    if progress:
+        current, total, audit_base_name = progress
+        st.sidebar.progress(
+            min(1.0, current / total),
+            text=f"База {current} из {total}: {audit_base_name}",
+        )
+    elif info.get("scope") == "single":
+        st.sidebar.progress(0.0, text="Аудит одной базы...")
+    else:
+        st.sidebar.progress(0.0, text="Подготовка и сбор данных...")
+
+
 def main():
     st.set_page_config(page_title="Учёт нормочасов", layout="wide")
     if auth.auth_enabled() and not st.session_state.get("login"):
@@ -2324,6 +2357,8 @@ def main():
         _store_access_ctx()
 
     _render_logout_button()
+
+    render_audit_progress()
 
     base = select_base()
 
