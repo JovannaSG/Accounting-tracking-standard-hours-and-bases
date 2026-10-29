@@ -403,7 +403,7 @@ def _visible_databases(entries: list) -> list:
 def _list_bases_or_error(active_only: bool, where=None) -> list[dict]:
     """
     db.list_bases с понятным сообщением вместо трассировки, если ключ
-    шифрования задан, но неверен: приложение не может показать пароли,
+    шифрования business, но неверен: приложение не может показать пароли,
     которые лежат в БД зашифрованными.
     """
 
@@ -533,7 +533,7 @@ def run_report(
     Выгружает документы и строит отчёт.
 
     ``selected_types`` приходит из блока «Блок операций» в сайдбаре.
-    Настройка базы (active_doc_types) сужает его: список заданной
+    Настройка базы (active_doc_types) сужает его: список businessной
     администратором базы — белый список, а блок операций выбирает внутри
     него. Пустой список у базы означает «выгружать все виды».
     """
@@ -792,6 +792,25 @@ def render_diagnostics_tab(base: dict):
             })
         st.dataframe(pd.DataFrame(rows))
         st.markdown(f"Всего сущностей в составе: **{len(sets)}**")
+
+    st.markdown("---")
+    st.subheader("DB Debug: История 'Не распределено'")
+    if st.button("Проверить audit_hours (SQL)"):
+        conn = db._audit_conn()
+        try:
+            debug_df = pd.read_sql_query(
+                """
+                SELECT run_id, employee, SUM(operations) as ops
+                FROM audit_hours
+                WHERE employee LIKE 'Не распределено%'
+                GROUP BY run_id, employee
+                ORDER BY run_id DESC
+                """,
+                conn
+            )
+            st.dataframe(debug_df, use_container_width=True)
+        finally:
+            conn.close()
 
 
 def render_norms_tab():
@@ -1986,6 +2005,70 @@ def render_audit_tab():
                         "Операции есть, но нормочасы равны нулю: проверьте "
                         "активные нормы для этих видов документов."
                     )
+
+                active_run_ids = list({r.get("run_id") for r in rows if r.get("run_id")})
+                if active_run_ids:
+                    conn = db._audit_conn()
+                    try:
+                        placeholders = ",".join("?" * len(active_run_ids))
+                        unassigned_df = pd.read_sql_query(
+                            f"""
+                            SELECT 
+                                entity_name as 'Сущность (Таблица 1С)',
+                                employee as 'Автор (Алиас из 1С)',
+                                SUM(operations) as 'Операций',
+                                SUM(hours) as 'Нормочасов'
+                            FROM audit_hours
+                            WHERE run_id IN ({placeholders}) 
+                                AND employee LIKE 'Не распределено%' 
+                                AND operations > 0
+                            GROUP BY entity_name, employee
+                            ORDER BY SUM(operations) DESC
+                            """,
+                            conn,
+                            params=active_run_ids
+                        )
+                    finally:
+                        conn.close()
+
+            if not unassigned_df.empty:
+                df = unassigned_df.copy()
+                def _clean_name(s):
+                    s = str(s or "")
+                    m = re.search(r'Не распределено\s*\((.+?)\)', s)
+                    if m:
+                        name = m.group(1).strip()
+                        return None if name == "Системный документ без автора" else name
+                    if s.strip() == "Не распределено, автор не найден":
+                        return None
+                    if s.strip() == "Не распределено":
+                        return None
+                    return None
+
+                df['Чистое имя'] = df['Автор (Алиас из 1С)'].apply(_clean_name)
+                df = df[df['Чистое имя'].notna()]
+                if not df.empty:
+                    names_list = df['Чистое имя'].dropna().unique().tolist()
+                    actually_unmapped = set(unmapped_users(names_list))
+                    final_df = df[df['Чистое имя'].isin(actually_unmapped)].copy()
+                    if not final_df.empty:
+                        final_df['Автор (Алиас из 1С)'] = final_df['Чистое имя']
+                        final_df.drop(columns=['Чистое имя'], inplace=True)
+                        total_unassigned = int(final_df['Операций'].sum())
+                        with st.expander(f"Не распределены (нет записи в сотрудниках) · {total_unassigned} операций"):
+                            st.caption(
+                                "Скопируйте эти имена и добавьте их во вкладке «Сотрудники», "
+                                "затем перезапустите аудит"
+                            )
+                            st.dataframe(
+                                final_df,
+                                hide_index=True,
+                                use_container_width=True,
+                                column_config={
+                                    "Нормочасов": st.column_config.NumberColumn(format="%.2f")
+                                }
+                            )
+
                 st.markdown("---")
                 col_export, _ = st.columns(2)
                 with col_export:
@@ -2351,7 +2434,7 @@ def render_audit_progress():
     if chunk_info:
         c_chunk, t_chunk = chunk_info
         pct = min(1.0, c_chunk / t_chunk) if t_chunk > 0 else 0.0
-        st.progress(pct, text=f"Задания: {c_chunk} из {t_chunk}")
+        st.progress(pct, text=f"Прогресс: {c_chunk} из {t_chunk}")
     else:
         st.progress(0.0, text="Инициализация...")
 

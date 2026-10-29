@@ -435,8 +435,25 @@ def _business_bucket(
     company = (
         client.organization_info(org_guid).get("name", "") if org_guid else ""
     )
-    author_guid = rec.get("Ответственный_Key")
-    author = client._name_by_guid(author_guid) if author_guid else ""
+
+    author = ""
+    # Пробуем взять готовое строковое имя,
+    # если 1С прислала его текстом (как это видит Отчет)
+    for field in (
+        "Ответственный", "Ответственный_Presentation",
+        "Автор", "Автор_Presentation"
+    ):
+        val = rec.get(field)
+        if isinstance(val, str) and val.strip():
+            author = val.strip()
+            break
+            
+    # Если текста нет, ищем GUID (проверяя оба варианта ключа)
+    # и резолвим через справочник
+    if not author:
+        author_guid = rec.get("Ответственный_Key") or rec.get("Автор_Key")
+        if author_guid:
+            author = client._name_by_guid(author_guid) or ""
 
     cache_key = (author, title)
     business = cache.get(cache_key)
@@ -446,7 +463,14 @@ def _business_bucket(
         )
         cache[cache_key] = business
 
-    bucket = buckets.setdefault((company, business["full_name"]), [0, 0.0])
+    employee_name = business["full_name"]
+    if employee_name == "Не распределено":
+        if author and str(author).strip():
+            employee_name = f"Не распределено ({str(author).strip()})"
+        else:
+            employee_name = "Не распределено, автор не найден"
+
+    bucket = buckets.setdefault((company, employee_name), [0, 0.0])
     bucket[0] += 1
     bucket[1] += business["hours"]
 
@@ -589,8 +613,11 @@ def _run_chunk(
         count, count_available = _count_records(
             client, entity, chunk_start, chunk_end
         )
-        mismatch = (abs(count - rows) if count_available and count is not None
-                    else 0)
+        mismatch = (
+            abs(count - rows)
+            if count_available and count is not None
+            else 0
+        )
         degraded = 1 if entity in client._degraded_entities else 0
         finished = datetime.now().isoformat(timespec="seconds")
 
