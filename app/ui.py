@@ -1899,9 +1899,17 @@ def render_audit_tab():
             st.rerun()
 
     st.divider()
-    head_left, head_right = st.columns([4, 1])
+    head_left, head_right = st.columns([3, 1])
     head_left.subheader("Нормочасы по итогам аудита")
-    if head_right.button("Обновить", key="audit_refresh"):
+
+    btn_refresh, btn_clear = head_right.columns(2)
+    if btn_refresh.button("Обновить", key="audit_refresh", use_container_width=True):
+        st.rerun()
+
+    if btn_clear.button("Очистить", key="audit_clear_filters", use_container_width=True):
+        # Удаляем сохраненные фильтры из кэша сессии
+        st.session_state["audit_hours_companies"] = []
+        st.session_state["audit_hours_employees"] = []
         st.rerun()
 
     rows = audit.audit_summary()
@@ -1975,6 +1983,8 @@ def render_audit_tab():
                 "Сотрудников",
                 f"{len({r.get('employee') for r in filtered})}",
             )
+
+            unassigned_df = pd.DataFrame()
 
             if not filtered:
                 st.info("Нет строк под выбранные фильтры.")
@@ -2086,6 +2096,34 @@ def render_audit_tab():
                     )
 
         with st.expander("Техническое состояние аудита (расхождения, gaps, ошибки)"):
+            trunc = []
+            try:
+                conn = db._audit_conn()
+                try:
+                    for rid in active_run_ids:
+                        cur = conn.execute(
+                            "SELECT entity_name, chunk_start, chunk_end, rows_processed, expected_count, error FROM audit_checkpoints WHERE run_id=? AND error LIKE '%POSSIBLE_TRUNCATION%'",
+                            (rid,),
+                        )
+                        for r in cur.fetchall():
+                            trunc.append({
+                                "Сущность": r[0],
+                                "Период": f"{r[1]}..{r[2]}",
+                                "Получено": r[3],
+                                "Ожидалось ($count)": r[4],
+                                "Предупреждение": r[5],
+                            })
+                finally:
+                    conn.close()
+            except Exception:
+                trunc = []
+            if trunc:
+                st.warning(
+                    "Обнаружено возможное скрытое усечение OData (лимит $skip/$top). "
+                    "Рекомендуется прогнать эту базу в режиме «Помесячно (безопасно)» "
+                    "и сравнить суммы. Данные не обнулены, но часть записей могла не загрузиться."
+                )
+                st.dataframe(trunc, use_container_width=True, hide_index=True)
             st.dataframe(
                 _audit_summary_table(rows),
                 use_container_width=True

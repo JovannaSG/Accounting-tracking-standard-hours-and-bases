@@ -304,6 +304,7 @@ def run_audit(
         "chunks_failed": 0,
         "count_mismatches": 0,
         "degraded_entities": [],
+        "truncation_suspected": [],
     }
 
     entity_specs = _audit_entity_specs(base)
@@ -340,14 +341,13 @@ def run_audit(
         logger.debug(f"Не удалось расширить список сущностей: {e}")
 
     print(f"Предварительная проверка {len(selected_entities)} таблиц на наличие данных...", file=sys.stderr, flush=True)
-    
+
     selected_entities = get_active_entities(
-        client=client, 
-        entities=selected_entities, 
-        start_date=period_start, 
-        end_date=period_end, 
-        # Используем 5 потоков, чтобы избежать ошибки 503 от сервера 1С
-        max_workers=5
+        client=client,
+        entities=selected_entities,
+        start_date=period_start,
+        end_date=period_end,
+        max_workers=2
     )
 
     chunks = _chunks(period_start, period_end, chunk_mode)
@@ -385,6 +385,19 @@ def run_audit(
                 summary["chunks_skipped"] += 1
             elif status == db.AUDIT_CP_COMPLETED:
                 summary["chunks_completed"] += 1
+                try:
+                    cp = db.get_checkpoint(base_url, entity, chunk_start, chunk_end)
+                    err = (cp or {}).get("error") or ""
+                    if "POSSIBLE_TRUNCATION" in str(err):
+                        summary.setdefault("truncation_suspected", []).append({
+                            "entity": entity,
+                            "chunk_start": chunk_start,
+                            "chunk_end": chunk_end,
+                            "rows_processed": (cp or {}).get("rows_processed"),
+                            "expected_count": (cp or {}).get("expected_count"),
+                        })
+                except Exception:
+                    pass
             elif status == db.AUDIT_CP_FAILED:
                 summary["chunks_failed"] += 1
 
@@ -490,6 +503,7 @@ def _run_chunk(
 ) -> str:
     """
     Аудит одного (entity × месяц); возвращает итоговый статус чанка
+    Встроен умный Fallback: при усечении OData дробит период на месяцы.
     """
 
     conn = db._audit_conn()
@@ -515,10 +529,6 @@ def _run_chunk(
     if completed and db.has_audit_hours(
         base_url, entity, chunk_start, chunk_end
     ):
-        # Его checkpoint должен «принадлежать» текущему run'у: иначе отчёт
-        # (list_audit_checkpoints по run_id) после резюма потерял бы все
-        # ранее завершённые чанки — вместе с их расхождениями с ожидаемым
-        # количеством и деградацией. Тот же приём — у audit_hours.
         conn = db._audit_conn()
         try:
             conn.execute(
@@ -554,9 +564,7 @@ def _run_chunk(
     finally:
         conn.close()
 
-    # Старые строки чанка могли остаться от предыдущего прогона (в т.ч.
-    # успешного, если теперь перечитываем ради бэкфилла). Сбрасываем их:
-    # при ошибке дашборд не должен показать устаревшие часы.
+    # Старые строки чанка могли остаться от предыдущего прогона. Сбрасываем их.
     db.replace_audit_hours(
         base_url, entity, chunk_start, chunk_end, run_id, []
     )
@@ -574,14 +582,12 @@ def _run_chunk(
         nonlocal pages
         pages += 1
 
-        # Проверяем команду на остановку от интерфейса
         flag_path = config.AUDIT_LOCK_FILE + ".stop"
         if os.path.exists(flag_path):
             try:
                 os.remove(flag_path)
             except OSError:
                 pass
-            # Имитируем SIGTERM для безопасного сохранения чекпоинта
             raise KeyboardInterrupt
 
     try:
@@ -618,6 +624,63 @@ def _run_chunk(
             if count_available and count is not None
             else 0
         )
+
+        # =====================================================================
+        # НОВЫЙ БЛОК: УМНЫЙ FALLBACK ПРИ УСЕЧЕНИИ (ПАГИНАЦИЯ ODATA)
+        # =====================================================================
+        if mismatch > 0 and count_available and count is not None and count > rows:
+            sub_chunks = _month_chunks(chunk_start, chunk_end)
+            
+            # Если период можно раздробить (он больше 1 месяца)
+            if len(sub_chunks) > 1:
+                logger.warning(
+                    f"[{entity}] 1С усекла данные ({rows}/{count}). "
+                    f"Fallback: дробление периода {chunk_start}..{chunk_end} на {len(sub_chunks)} мес."
+                )
+                
+                # 1. Очищаем "грязные" (усеченные) агрегаты этого большого чанка
+                db.replace_audit_hours(base_url, entity, chunk_start, chunk_end, run_id, [])
+                
+                # 2. Удаляем чекпоинт большого чанка из базы, чтобы не двоило статистику
+                conn_del = db._audit_conn()
+                try:
+                    conn_del.execute(
+                        "DELETE FROM audit_checkpoints WHERE base_url=? AND entity_name=? "
+                        "AND chunk_start=? AND chunk_end=?",
+                        (base_url, entity, chunk_start, chunk_end)
+                    )
+                    conn_del.commit()
+                finally:
+                    conn_del.close()
+
+                # 3. Рекурсивно скачиваем каждый месяц как отдельный чанк
+                for sub_start, sub_end in sub_chunks:
+                    _run_chunk(
+                        client=client,
+                        run_id=run_id,
+                        base_url=base_url,
+                        entity=entity,
+                        chunk_start=sub_start,
+                        chunk_end=sub_end,
+                        pause=pause,
+                        restart=True,  # Принудительно, чтобы записалось чисто
+                        entries=entries,
+                        by_title=by_title,
+                        employees=employees,
+                    )
+                
+                # Возвращаем статус успеха. Реальные чекпоинты записаны внутри рекурсии.
+                return db.AUDIT_CP_COMPLETED
+        # =====================================================================
+
+        # Резервное предупреждение, если усечение произошло даже внутри ОДНОГО месяца
+        truncated = False
+        trunc_warn = None
+        if count_available and count is not None and rows >= 9000 and count > rows + 100:
+            truncated = True
+            trunc_warn = f"POSSIBLE_TRUNCATION: получено {rows} из {count} (возможен лимит $skip/$top >10000). Месяц превысил лимиты."
+            logger.warning("Возможное скрытое усечение OData: %s %s..%s получено %s из %s", entity, chunk_start, chunk_end, rows, count)
+        
         degraded = 1 if entity in client._degraded_entities else 0
         finished = datetime.now().isoformat(timespec="seconds")
 
@@ -626,22 +689,20 @@ def _run_chunk(
             conn.execute(
                 "UPDATE audit_checkpoints SET status=?, rows_processed=?, "
                 "sum_amount=?, page_count=?, degraded=?, expected_count=?, "
-                "count_available=?, count_mismatch=?, finished_at=? "
+                "count_available=?, count_mismatch=?, error=COALESCE(?, error), finished_at=? "
                 "WHERE base_url=? AND entity_name=? AND chunk_start=? "
                 "AND chunk_end=?",
                 (db.AUDIT_CP_COMPLETED, rows, round(total, 2), pages,
-                 degraded, count, int(count_available), mismatch, finished,
+                 degraded, count, int(count_available), mismatch,
+                 trunc_warn if truncated else None, finished,
                  base_url, entity, chunk_start, chunk_end),
             )
             conn.commit()
         finally:
             conn.close()
         return db.AUDIT_CP_COMPLETED
+        
     except EntityNotFoundError:
-        # 404: сущности нет в этой базе (не активирован контур — ГТД, зарплата
-        # и т.п.). Это не сбой: помечаем COMPLETED с 0 строк, чтобы (а) резюм
-        # не дёргал её снова и (б) она не попала в «Проблемы». Пометка в
-        # error видна в «Сводке», но «Проблемы» фильтруют по COMPLETED.
         finished = datetime.now().isoformat(timespec="seconds")
         conn = db._audit_conn()
         try:
@@ -660,16 +721,43 @@ def _run_chunk(
         return _CHUNK_NOT_APPLICABLE
     except ValueError as e:
         msg = str(e)
-        # 400/500, невозможность построить совместимый $select даже после
-        # фолбэка — не фатальный сбой аудита всей базы: помечаем завершённым
-        # с 0 строк, чтобы можно было резюмировать и увидеть в сводке.
-        if _is_select_error(msg) or "400" in msg or "500" in msg:
+        if "404" in msg:
             finished = datetime.now().isoformat(timespec="seconds")
             conn = db._audit_conn()
             try:
-                db.replace_audit_hours(
-                    base_url, entity, chunk_start, chunk_end, run_id, []
+                conn.execute(
+                    "UPDATE audit_checkpoints SET status=?, rows_processed=0, "
+                    "sum_amount=0, page_count=0, degraded=0, expected_count=NULL, "
+                    "count_available=0, count_mismatch=0, error=?, finished_at=? "
+                    "WHERE base_url=? AND entity_name=? AND chunk_start=? "
+                    "AND chunk_end=?",
+                    (db.AUDIT_CP_COMPLETED, "сущность отсутствует в базе (404)",
+                     finished, base_url, entity, chunk_start, chunk_end),
                 )
+                conn.commit()
+            finally:
+                conn.close()
+            return _CHUNK_NOT_APPLICABLE
+        if any(code in msg for code in ("500", "502", "503", "504")):
+            logger.error("Транзиентная ошибка 5xx чанка %s %s: %s", entity, chunk_start, msg)
+            failed = datetime.now().isoformat(timespec="seconds")
+            conn = db._audit_conn()
+            try:
+                conn.execute(
+                    "UPDATE audit_checkpoints SET status=?, error=?, finished_at=? "
+                    "WHERE base_url=? AND entity_name=? AND chunk_start=? "
+                    "AND chunk_end=?",
+                    (db.AUDIT_CP_FAILED, msg[:500], failed,
+                     base_url, entity, chunk_start, chunk_end),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            return db.AUDIT_CP_FAILED
+        if _is_select_error(msg) or "400" in msg:
+            finished = datetime.now().isoformat(timespec="seconds")
+            conn = db._audit_conn()
+            try:
                 conn.execute(
                     "UPDATE audit_checkpoints SET status=?, rows_processed=0, "
                     "sum_amount=0, page_count=0, degraded=1, expected_count=NULL, "
@@ -687,9 +775,6 @@ def _run_chunk(
         failed = datetime.now().isoformat(timespec="seconds")
         conn = db._audit_conn()
         try:
-            db.replace_audit_hours(
-                base_url, entity, chunk_start, chunk_end, run_id, []
-            )
             conn.execute(
                 "UPDATE audit_checkpoints SET status=?, error=?, finished_at=? "
                 "WHERE base_url=? AND entity_name=? AND chunk_start=? "
@@ -702,6 +787,23 @@ def _run_chunk(
             conn.close()
         return db.AUDIT_CP_FAILED
     except Exception as e:
+        msg = str(e)
+        if any(code in msg for code in ("500", "502", "503", "504")):
+            logger.error("Транзиентная ошибка 5xx чанка %s %s: %s", entity, chunk_start, msg)
+            failed = datetime.now().isoformat(timespec="seconds")
+            conn = db._audit_conn()
+            try:
+                conn.execute(
+                    "UPDATE audit_checkpoints SET status=?, error=?, finished_at=? "
+                    "WHERE base_url=? AND entity_name=? AND chunk_start=? "
+                    "AND chunk_end=?",
+                    (db.AUDIT_CP_FAILED, msg[:500], failed,
+                     base_url, entity, chunk_start, chunk_end),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            return db.AUDIT_CP_FAILED
         failed = datetime.now().isoformat(timespec="seconds")
         conn = db._audit_conn()
         try:
@@ -709,7 +811,7 @@ def _run_chunk(
                 "UPDATE audit_checkpoints SET status=?, error=?, finished_at=? "
                 "WHERE base_url=? AND entity_name=? AND chunk_start=? "
                 "AND chunk_end=?",
-                (db.AUDIT_CP_FAILED, str(e)[:500], failed,
+                (db.AUDIT_CP_FAILED, msg[:500], failed,
                  base_url, entity, chunk_start, chunk_end),
             )
             conn.commit()
@@ -1517,6 +1619,11 @@ def _run_all_bases(
         except Exception as e:
             print(f"  Пропущено: {e}", file=sys.stderr)
             failures += 1
+        try:
+            if i < total:
+                time.sleep(2.0)
+        except Exception:
+            pass
     print(f"Пакетный аудит завершён: баз {total}, с ошибками {failures}.")
     return 1 if failures else 0
 

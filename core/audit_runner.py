@@ -254,12 +254,10 @@ def stop(
 ) -> bool:
     """
     SIGTERM группе процесса аудита. True — сигнал отправлен.
-
-    Защита от переиспользования PID: сигнал шлётся только если блокировка
-    ещё удерживается (аудит действительно идёт).
     """
+    if not is_running(lock_file):
+        return False
 
-    # Создаем файл-флаг остановки (работает везде)
     flag_path = _lock_file(lock_file) + ".stop"
     try:
         with open(flag_path, "w", encoding="utf-8") as f:
@@ -267,7 +265,6 @@ def stop(
     except OSError:
         pass
 
-    # Старый метод по PID (оставляем как подстраховку)
     pid = read_status(status_file).get("pid")
     if pid:
         try:

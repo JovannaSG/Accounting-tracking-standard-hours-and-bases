@@ -13,8 +13,8 @@ def clean_db():
 
 def test_seed_adds_all_norm_keys(clean_db):
     inserted = seed_default_norms(sno="УСН «Доходы»")
-    assert inserted == 37
-    assert db.count_norms() == 37
+    assert inserted == 39
+    assert db.count_norms() == 39
 
     travel = db.get_norm(doc_type="advance_report_travel")
     assert travel["norm_hours"] == 0.375
@@ -40,9 +40,9 @@ def test_seed_adds_all_norm_keys(clean_db):
 
 
 def test_seed_is_idempotent(clean_db):
-    assert seed_default_norms() == 37
+    assert seed_default_norms() == 39
     assert seed_default_norms() == 0
-    assert db.count_norms() == 37
+    assert db.count_norms() == 39
 
 
 def test_seed_preserves_admin_hours_and_updates_title(clean_db):

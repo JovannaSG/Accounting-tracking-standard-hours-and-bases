@@ -68,7 +68,7 @@ def get_active_entities(
     entities,
     start_date,
     end_date,
-    max_workers=10
+    max_workers=2
 ) -> list:
     active_entities: list = []
 
@@ -89,16 +89,34 @@ def get_active_entities(
 
         # Получаем результаты по мере их готовности (не дожидаясь остальных)
         for future in concurrent.futures.as_completed(future_to_entity):
-            entity, is_active = future.result()
-            if is_active:
-                active_entities.append(entity)
-            else:
-                print(
-                    f"[{entity}] Таблица пуста, пропускаем",
-                    file=sys.stderr,
-                    flush=True
-                )
-                
+            entity = future_to_entity.get(future)
+            try:
+                entity_res, is_active = future.result()
+                if is_active is True:
+                    active_entities.append(entity_res)
+                elif is_active is False:
+                    print(
+                        f"[{entity_res}] Таблица пуста, пропускаем",
+                        file=sys.stderr,
+                        flush=True
+                    )
+                    continue
+                elif is_active is None:
+                    logger.warning("get_active_entities: %s не проверен из-за ошибки сети/таймаута — оставляем для прогона чанка", entity)
+                    active_entities.append(entity_res or entity)
+                    continue
+                else:
+                    active_entities.append(entity_res or entity)
+            except EntityNotFoundError:
+                if entity:
+                    active_entities.append(entity)
+                continue
+            except Exception as e:
+                logger.warning("get_active_entities: %s не проверен из-за ошибки: %s", entity, e)
+                if entity:
+                    active_entities.append(entity)
+                continue
+
     return active_entities
 
 

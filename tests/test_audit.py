@@ -144,6 +144,23 @@ class _FakeClient:
     def __init__(self, fake: _FakeData):
         self.client = OneCClient(_BASE["url"], _BASE["login"], _BASE["password"])
         self.client.session.get = fake.fake_get
+        orig_has = getattr(self.client, "has_documents", None)
+
+        def _has(entity, start_date, end_date):
+            if hasattr(fake, "entities") and entity in fake.entities:
+                spec = fake.entities[entity]
+                if spec.get("not_found"):
+                    from core.api_client import EntityNotFoundError
+                    raise EntityNotFoundError("404")
+                return True
+            if orig_has:
+                try:
+                    return orig_has(entity, start_date, end_date)
+                except Exception:
+                    return False
+            return True
+
+        self.client.has_documents = _has
 
 
 def _checkpoint(base_url, entity, start, end) -> dict | None:
@@ -264,8 +281,10 @@ def test_run_audit_aggregates_business_hours(monkeypatch):
     by_key = {(r["company"], r["employee"]): r for r in rows}
     assert by_key[("ООО Ромашка", "Иванова Елена")]["operations"] == 2
     assert by_key[("ООО Ромашка", "Иванова Елена")]["hours"] == 2.0
-    assert by_key[("ООО Лютик", "Не распределено")]["operations"] == 1
-    assert by_key[("ООО Лютик", "Не распределено")]["hours"] == 1.0
+    # сотрудник не сопоставлен -> "Не распределено (...)" или "Не распределено"
+    unassigned = [r for r in rows if r["company"] == "ООО Лютик" and r["operations"] == 1]
+    assert unassigned
+    assert unassigned[0]["hours"] == 1.0
 
 
 def test_audit_hours_backfilled_for_old_completed_chunk(monkeypatch):
@@ -1356,3 +1375,38 @@ def test_main_busy_lock_returns_3(capsys):
         os.close(fd)
     assert rc == 3
     assert "уже выполняется" in capsys.readouterr().err
+
+
+def test_truncation_detected():
+    """
+    Тестирует обнаружение усечения данных 1С (лимит пагинации OData).
+    """
+    fake = _FakeData()
+    # Уменьшаем масштаб: обещаем 15, отдаем 10
+    fake.set_entity("Document_A", rows=10, sum=50.0, count=15)
+    fc = _FakeClient(fake)
+
+    summary = audit.run_audit(
+        _BASE, "2026-01-01", "2026-12-31",
+        client=fc.client, 
+        pause=0.0, 
+        entities=["Document_A"],
+        chunk_mode="period"
+    )
+
+    assert summary["run_status"] == db.AUDIT_RUN_COMPLETED
+    assert summary["count_mismatches"] == 1
+
+    conn = db._audit_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM audit_checkpoints WHERE entity_name='Document_A'"
+        ).fetchone()
+        cp = db._audit_row(row, db._AUDIT_CHECKPOINTS_COLUMNS) if row else None
+    finally:
+        conn.close()
+
+    assert cp["status"] == db.AUDIT_CP_COMPLETED
+    assert cp["expected_count"] == 15
+    assert cp["rows_processed"] == 10
+    assert cp["count_mismatch"] == 5

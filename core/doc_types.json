@@ -269,13 +269,13 @@
     "entity": "Document_ФормированиеУставногоКапитала",
     "unit": "документ"
   },
-  "reconciliation statement": {
+  "reconciliation_statement": {
     "title": "Акт сверки взаиморасчетов",
     "category": "Первичные документы",
     "entity": "Document_АктСверкиВзаиморасчетов",
     "unit": "документ"
   },
-  "commission agent's report": {
+  "commission_agents_report": {
     "title": "Отчет комиссионера о продажах",
     "category": "Первичные документы",
     "entity": "Document_ОтчетКомиссионераОПродажах",

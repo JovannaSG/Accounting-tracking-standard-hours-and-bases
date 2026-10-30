@@ -55,6 +55,8 @@ DEFAULT_NORMS_HOURS: dict[str, float] = {
     "routine_operation": 0.0,
     # Формирование уставного капитала
     "authorized_capital_formation": 0.15,
+    "reconciliation_statement": 0.0,
+    "commission_agents_report": 0.0,
 }
 
 # Комментарии для норм без значения в ТЗ (администратор задаёт вручную)
@@ -62,6 +64,8 @@ DEFAULT_NORMS_COMMENTS: dict[str, str] = {
     "writeoff_materials_from_use": "Норма не задана в ТЗ — укажите вручную",
     "return_customer": "Норма не задана в ТЗ — укажите вручную",
     "customs_declaration": "Норма не задана в ТЗ — укажите вручную",
+    "reconciliation_statement": "Норма не задана в ТЗ — укажите вручную",
+    "commission_agents_report": "Норма не задана в ТЗ — укажите вручную",
 }
 
 
